@@ -6,9 +6,7 @@ from astropy.timeseries import LombScargle
 
 np.random.seed(42)
 
-# -------------------------
-# Load HST data
-# -------------------------
+
 INPUT_TXT = "full_LC_stel_puls_orb_params.txt"
 
 data = np.loadtxt(INPUT_TXT)
@@ -21,26 +19,18 @@ flux_norm = flux + 1.0
 
 print(f"HST data: {len(time)} points over {t_rel[-1]:.2f} days")
 
-# -------------------------
-# Inflate errors if needed
-# -------------------------
+
 out_of_transit_std = np.std(flux_norm[t_rel > 0.3])
 if out_of_transit_std > 3 * np.median(flux_err):
     print(f"Inflating errors to match scatter")
     flux_err = np.sqrt(flux_err**2 + (out_of_transit_std * 0.5)**2)
 
-# -------------------------
-# Planet flux model
-# -------------------------
 def planet_flux_model(t, Fp_Fsmin, c1, c2, c3, c4, c5, c6):
     u = np.where(t < c2, (t - c2) / c3, (t - c2) / c4)
     eclipse = (t > (c5 - 0.5*c6)) & (t < (c5 + 0.5*c6))
     model = np.where(eclipse, 0.0, Fp_Fsmin + c1/(u**2 + 1.0))
     return model
 
-# -------------------------
-# Combined batman + planet flux model
-# -------------------------
 period = 5.6334729
 orbital_freq = 1.0 / period
 
@@ -66,9 +56,6 @@ def model(theta, t_arr):
     
     return transit + planet - Fp_Fsmin
 
-# -------------------------
-# MCMC functions
-# -------------------------
 def log_likelihood(theta, t_arr, f_arr, ferr_arr):
     model_flux = model(theta, t_arr)
     residuals = (f_arr - model_flux) / ferr_arr
@@ -98,9 +85,7 @@ def log_prob(theta, t_arr, f_arr, ferr_arr):
         return -np.inf
     return lp + log_likelihood(theta, t_arr, f_arr, ferr_arr)
 
-# -------------------------
-# Run MCMC
-# -------------------------
+
 init = np.array([0.14, 0.070, 8.9, 86.3, 0.2, 0.3, 
                  0.00005, 0.0005, 1.05, 1.5, 0.2, 1.23, 0.11])
 
@@ -114,9 +99,6 @@ print("\nRunning MCMC...")
 sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob, args=(t_rel, flux_norm, flux_err))
 sampler.run_mcmc(pos, nsteps, progress=True)
 
-# -------------------------
-# Get best fit
-# -------------------------
 flat = sampler.get_chain(discard=800, thin=15, flat=True)
 best = np.median(flat, axis=0)
 
@@ -124,9 +106,6 @@ best_model = model(best, t_rel)
 
 print(f"\nReduced chi-squared: {np.sum(((flux_norm - best_model) / flux_err)**2) / (len(flux_norm) - ndim):.4f}")
 
-# ===========================
-# SIGNAL INJECTION
-# ===========================
 f_79 = 79 * orbital_freq
 f_91 = 91 * orbital_freq
 
@@ -200,15 +179,13 @@ for trial in range(n_trials):
     })
     print()
 
-# ===========================
-# PLOT LAST TRIAL
-# ===========================
+
 last_result = results[-1]
 
 fig, ax = plt.subplots(1, 1, figsize=(14, 6))
 
 ax.plot(last_result['freq_full'], last_result['power_full'], 'k-', lw=1.5, alpha=0.7)
-# ADD FAP LINES TO PLOT (NEW CODE)
+
 labels = ['~10% FAP', '~1% FAP', '~0.01% FAP', '~0.0001% FAP']
 colors = ['red', 'orange', 'purple', 'darkred']
 for amp, label, color in zip(alarm_amplitude, labels, colors):
@@ -230,9 +207,6 @@ ax.set_xlim(5, 17)
 plt.tight_layout()
 plt.show()
 
-# ===========================
-# SUMMARY
-# ===========================
 print(f"\n{'='*60}")
 print("SUMMARY:")
 print(f"{'='*60}")

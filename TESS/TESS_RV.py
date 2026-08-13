@@ -1,8 +1,6 @@
 import os
 
-# ---------------------------
 # Make RadVel happy on Windows
-# ---------------------------
 if 'HOME' not in os.environ:
     os.environ['HOME'] = os.environ.get('USERPROFILE', os.path.expanduser('~'))
 
@@ -17,10 +15,6 @@ import radvel.likelihood as rlike
 import warnings
 warnings.filterwarnings('ignore')
 
-
-# =====================================================
-# ORBITAL CONSTANTS (literature values as priors)
-# =====================================================
 PERIOD   = 5.6334729       # HAT-P-2b period (days)
 TC_REF   = 2454529.674     # reference transit epoch (BJD)
 E_LIT    = 0.502
@@ -35,21 +29,15 @@ LN_JIT_SIGMA  = 0.7           # RV jitter prior width
 
 
 def e_omega_from_se(secosw_val, sesinw_val):
-    """Convert secosw,sesinw back to e,omega."""
     e_val = secosw_val**2 + sesinw_val**2
     omega_val = np.arctan2(sesinw_val, secosw_val)
     return e_val, omega_val
 
 
 def phase_fold(t, tc_use, per_use):
-    """Compute orbital phase from times."""
     return np.mod((t - tc_use) / per_use, 1.0)
 
 
-# =====================================================
-# LOAD RV DATA: hat_p2_rv.txt
-# Columns: BJD-2450000  RV(m/s)  e_RV(m/s)  inst (0=HIRES, 1=HARPS-N)
-# =====================================================
 rv_data = np.loadtxt("hat_p2_rv.txt")
 t_rv    = rv_data[:, 0] + 2450000.0
 rv_all  = rv_data[:, 1]
@@ -63,10 +51,6 @@ time_base = np.median(t_rv)
 t_rel_rv  = t_rv - time_base  # for secular trend g1,g2
 
 
-# =====================================================
-# LOAD TESS LIGHT CURVE: hatp2_tess_lightcurve.csv
-# time column is BTJD (BJD - 2457000)
-# =====================================================
 df_tess = pd.read_csv("hatp2_tess_lightcurve.csv")
 t_tess_btjd = np.array(df_tess["time"], dtype=float)        # BTJD
 f_tess      = np.array(df_tess["flux"], dtype=float)
@@ -122,9 +106,6 @@ t_win_bjd  = t_win_bjd[order]
 f_win      = f_win[order]
 ferr_win   = ferr_win[order]
 
-# =====================================================
-# INITIAL RV-ONLY FIT TO SETUP tc1,k,gammas,jitters (static model)
-# =====================================================
 params_static = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_static['per1']    = radvel.Parameter(value=PERIOD,    vary=False)
 params_static['tc1']     = radvel.Parameter(value=TC_REF,    vary=True)
@@ -164,15 +145,10 @@ tc1_init = best_static['tc1'].value
 k1_init  = best_static['k1'].value
 print("RV-only static tc1 =", tc1_init, "k1 =", k1_init)
 
-# =====================================================
-# INTEGER CYCLE COUNT BETWEEN RV tc1 AND TESS t0
-# N encodes which transit TESS is seeing relative to RV epoch
-# =====================================================
 N_cycles = int(np.round((t0_tess_bjd_est - tc1_init) / PERIOD))
 print("Integer cycle count N between RV tc1 and TESS t0:", N_cycles)
 
 
-# =====================================================
 # JOINT MODEL PARAMETERS (RV+TESS)
 # theta = [
 #   tc1, k1, secosw1, sesinw1,
@@ -182,7 +158,6 @@ print("Integer cycle count N between RV tc1 and TESS t0:", N_cycles)
 #   delta_t, ln_jit_tess,
 #   rp, a, inc
 # ]
-# =====================================================
 params_joint = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_joint['per1']    = radvel.Parameter(value=PERIOD,    vary=False)
 params_joint['tc1']     = radvel.Parameter(value=tc1_init,  vary=True)
@@ -246,7 +221,6 @@ def theta_initial():
 
 
 def theta_to_params(theta):
-    """Update RV and TESS parameter objects from theta."""
     (tc1, k1, secosw1, sesinw1,
      gamma_hires, gamma_harpsn,
      ln_jit_hires, ln_jit_harpsn,
@@ -281,7 +255,6 @@ def theta_to_params(theta):
 
 
 def rv_log_likelihood(theta):
-    """RV likelihood with jitter and quadratic trend."""
     delta_t, ln_jit_tess = theta_to_params(theta)
     rv_planet = mod_joint(t_rv)
 
@@ -314,7 +287,6 @@ def rv_log_likelihood(theta):
 
 
 def tess_model(theta, t_bjd_window):
-    """Build TESS transit model in window using joint orbit."""
     (tc1, k1, secosw1, sesinw1,
      gamma_hires, gamma_harpsn,
      ln_jit_hires, ln_jit_harpsn,
@@ -348,7 +320,6 @@ def tess_model(theta, t_bjd_window):
 
 
 def tess_log_likelihood(theta):
-    """TESS transit likelihood with jitter in flux units."""
     delta_t, ln_jit_tess = theta_to_params(theta)
 
     jit_tess = np.exp(ln_jit_tess)
@@ -441,10 +412,6 @@ def log_prob(theta, alpha_tess=1.0):
     lnL_tess = tess_log_likelihood(theta)
     return lp + lnL_rv + alpha_tess * lnL_tess
 
-
-# =====================================================
-# RUN EMCEE JOINT RV+TESS
-# =====================================================
 theta_start = theta_initial()
 ndim_joint  = len(theta_start)
 nwalkers    = 40
@@ -578,8 +545,6 @@ ax[1].set_ylabel('Residuals (m/s)')
 ax[1].grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
-
-# ----- Phase-folded TESS plot with direct model phase shift -----
 
 # data phases using the window already selected
 phase_win = ((t_win_bjd - t0_tess_bjd_est) / PERIOD) % 1.0

@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import batman
 from astropy.timeseries import LombScargle
 
-# ========== LOAD DATA ==========
 df = pd.read_csv("hatp2_tess_lightcurve.csv")
 t = np.array(df["time"])
 f = np.array(df["flux"])
@@ -21,7 +20,6 @@ ferr = ferr / median_flux
 period = 5.6334729
 orbital_freq = 1.0 / period
 
-# ========== FIND T0 BY GRID SEARCH ==========
 ntrial = 1200
 trial_offsets = np.linspace(0, period, ntrial)
 window_phase = 0.02
@@ -79,7 +77,6 @@ def model(theta, t_rel):
 best = np.array([t0_rel, rp, a, inc])
 best_flux = model(best, t - t0_est)
 
-# ========== INJECTION ==========
 f_79 = 79 * orbital_freq
 f_91 = 91 * orbital_freq
 
@@ -91,7 +88,6 @@ signal_79 = A_79 * np.cos(2*np.pi * f_79 * t + phi_79)
 signal_91 = A_91 * np.cos(2*np.pi * f_91 * t + phi_91)
 flux_inj = f + signal_79 + signal_91
 
-# ========== PERIODOGRAMS (UNFOLDED) ==========
 residuals = f - best_flux + 1.0
 residuals_inj = flux_inj - best_flux + 1.0
 
@@ -105,7 +101,6 @@ ls_inj = LombScargle(t, residuals_inj)
 freq_inj, power_inj = ls_inj.autopower(minimum_frequency=0.01, maximum_frequency=20, samples_per_peak=10)
 alarm_inj = ls_inj.false_alarm_level(probabilities)
 
-# ========== FOLDED  ==========
 t_fold = t % period
 sort_fold = np.argsort(t_fold)
 t_fold_sorted = t_fold[sort_fold]
@@ -129,8 +124,6 @@ alarm_fold = ls_fold.false_alarm_level(probabilities)
 ls_inj_fold = LombScargle(t_fold_sorted, residuals_inj_fold, ferr_fold)
 freq_inj_fold, power_inj_fold = ls_inj_fold.autopower(minimum_frequency=0.01, maximum_frequency=20, samples_per_peak=10)
 alarm_inj_fold = ls_inj_fold.false_alarm_level(probabilities)
-
-# ========== PLOTS ==========
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 ax1.plot(t_fold_sorted, flux_fold, ".", ms=2, alpha=0.4, label='Folded TESS flux')

@@ -1,60 +1,3 @@
-#!/usr/bin/env python3
-"""
-Phase 1 photometry extraction for the de Wit et al. HAT-P-2b Spitzer/IRAC 4.5 um dataset.
-
-This script combines:
-
-  - Lewis-style image processing and ramp handling:
-        * background estimation via iterative sigma-clipped Gaussian fit,
-        * transient hot-pixel repair across each 64-frame cube,
-        * flux-weighted centroiding in a central 3.5-pixel aperture,
-        * noise-pixel beta calculation,
-        * Lewis-style outlier rejection using a 16-point moving median,
-        * Lewis-style ramp handling: identify continuous time segments and
-          trim the first hour of each segment (standard 4.5 um ramp mitigation).
-
-  - de Wit-style 4.5 um data set and aperture philosophy:
-        * all 28 AORs listed in de Wit Table 1 (phase curve, transits,
-          occultations),
-        * time-varying apertures with radius r = sqrt(beta) + offset,
-          with per-AOR offsets optimized on a grid to minimize residual scatter
-          after moving-median detrending (as in your `spitzer_phase1_fixed.py`).
-
-  - spitzer_phase1_fixed-style design and outputs:
-        * safer subarray timing reconstruction based on MBJD_OBS and
-          FRAMTIME/AINTBEG/ATIMEEND,
-        * per-AOR aperture-offset optimization,
-        * per-visit normalization (flux_norm_visit),
-        * campaign-wide normalization (flux_norm_global),
-        * per-file and per-AOR summary tables,
-        * manifest JSON with timing diagnostics,
-        * four-panel diagnostic plot:
-              (a) x centroid,
-              (b) y centroid,
-              (c) noise-pixel beta,
-              (d) globally normalized relative flux, after ramp trimming
-                  and centroid/beta outlier clipping.
-
-Phase 1 therefore outputs an “instrumentally cleaned but still astrophysical”
-time series that already has:
-
-  - hot pixels repaired,
-  - ramp onset removed via first-hour trimming per segment,
-  - AOR-specific noise-pixel apertures,
-  - robust outlier clipping in flux and in centroid/beta,
-
-but does NOT:
-
-  - build an intrapixel sensitivity map,
-  - apply intrapixel corrections,
-  - fit explicit exponential ramp functions (those belong in Phase 2/3 if needed),
-  - fit transit, eclipse, phase curve, or pulsation models,
-  - run EMCEE.
-
-Downstream phases (2+) can use the CSVs from this script as their starting
-photometry products.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -70,10 +13,6 @@ import pandas as pd
 from astropy.io import fits
 from scipy.optimize import curve_fit
 
-
-# -------------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------------
 
 # Default de Wit 4.5 um AOR table (Table 1)
 DEFAULT_DEWIT_AOR_TABLE = [
@@ -126,19 +65,14 @@ APERTURE_R_FLOOR = 1.30
 APERTURE_R_CEIL = 3.00
 
 # Lewis/de Wit-style segment handling
-SEGMENT_GAP_HOURS = 1.0       # identify new segments from ~1 hr gaps
-TRIM_FIRST_HOUR = True        # trim first hour of each continuous segment
+SEGMENT_GAP_HOURS = 1.0
+TRIM_FIRST_HOUR = True
 TRIM_HOURS = 1.0
 
 EXPECTED_AOR_COUNT = 28
 EXPECTED_TOTAL_HOURS_RANGE = (330.0, 370.0)
 
 DIAG_FIGURE_NAME = "phase1_hatp2b_45um_diag.png"
-
-
-# -------------------------------------------------------------------------
-# Low-level utilities
-# -------------------------------------------------------------------------
 
 def gaussian(x, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
@@ -195,20 +129,7 @@ def fractional_circular_mask(shape, x0, y0, r, sub=8):
     frac /= float(sub * sub)
     return frac
 
-
-# -------------------------------------------------------------------------
-# Timing reconstruction (Lewis-style, subarray cubes)
-# -------------------------------------------------------------------------
-
 def compute_bjd_utc_for_cube(header, n_frames: int):
-    """
-    Lewis-style frame timing reconstruction for IRAC subarray cubes.
-
-    MBJD_OBS/BMJD_OBS is the start time of the first image in MJD.
-    Frames are assumed uniformly spaced over the interval defined by
-    AINTBEG and ATIMEEND. Returned timestamps are mid-exposure JD
-    in a BJD_UTC-like convention.
-    """
     mjd0 = get_header_value(header, "MBJD_OBS", "BMJD_OBS")
     if mjd0 is None:
         raise KeyError("Missing MBJD_OBS/BMJD_OBS in FITS header")
@@ -258,16 +179,7 @@ def compute_bjd_utc_for_cube(header, n_frames: int):
     }
     return jd_mid, timing_meta
 
-
-# -------------------------------------------------------------------------
-# Image-level processing
-# -------------------------------------------------------------------------
-
 def estimate_background(image: np.ndarray, rmin: float = BACKGROUND_RMIN) -> float:
-    """
-    Lewis-style background estimation: pixels beyond rmin from the PSF center,
-    iterative 3-sigma clipping and Gaussian fit to the histogram.
-    """
     ny, nx = image.shape
     x0 = (nx - 1) / 2.0
     y0 = (ny - 1) / 2.0
@@ -309,10 +221,6 @@ def estimate_background(image: np.ndarray, rmin: float = BACKGROUND_RMIN) -> flo
 
 
 def repair_hot_pixels_cube(cube: np.ndarray, sigma: float = SIGMA_HOTPIX):
-    """
-    Transient hot-pixel repair across a cube: flag values > sigma * std
-    at each pixel position over the 64 frames, replace with that pixel's median.
-    """
     cube = np.asarray(cube, dtype=float)
     med = np.nanmedian(cube, axis=0)
     std = np.nanstd(cube, axis=0)
@@ -325,9 +233,6 @@ def repair_hot_pixels_cube(cube: np.ndarray, sigma: float = SIGMA_HOTPIX):
 
 
 def flux_weighted_centroid(image: np.ndarray, r: float = CENTROID_R):
-    """
-    Flux-weighted centroid within a central aperture of radius r.
-    """
     ny, nx = image.shape
     x0 = (nx - 1) / 2.0
     y0 = (ny - 1) / 2.0
@@ -345,13 +250,6 @@ def flux_weighted_centroid(image: np.ndarray, r: float = CENTROID_R):
 
 
 def noise_pixel_beta(image: np.ndarray, x: float, y: float, r: float = CENTROID_R) -> float:
-    """
-    IRAC noise-pixel parameter:
-
-        beta = (sum I)^2 / sum I^2
-
-    within an aperture of radius r centered at (x, y).
-    """
     mask = circular_mask(image.shape, x, y, r)
     vals = image[mask].astype(float)
     vals = vals[np.isfinite(vals)]
@@ -368,22 +266,10 @@ def aperture_flux(image: np.ndarray, x: float, y: float, r: float) -> float:
 
 
 def aperture_radius_from_beta(beta: float, offset: float) -> float:
-    """
-    De Wit-style time-varying aperture:
-
-        r = sqrt(beta) + offset,
-
-    clipped to [APERTURE_R_FLOOR, APERTURE_R_CEIL].
-    """
     if not np.isfinite(beta) or beta <= 0:
         return np.nan
     r = math.sqrt(beta) + offset
     return float(np.clip(r, APERTURE_R_FLOOR, APERTURE_R_CEIL))
-
-
-# -------------------------------------------------------------------------
-# Data classes for summaries
-# -------------------------------------------------------------------------
 
 @dataclass
 class FileSummary:
@@ -421,18 +307,7 @@ class AORSummary:
     flux_scatter_ppm: float
 
 
-# -------------------------------------------------------------------------
-# Per-file processing
-# -------------------------------------------------------------------------
-
 def process_bcd_file(path: Path):
-    """
-    Process one subarray BCD cube into a per-frame DataFrame + FileSummary.
-
-    The DataFrame includes BJD_UTC, background, centroid, beta, and a
-    placeholder frame_ok_outlier flag; images themselves are retained in a
-    temporary '_image' column for later aperture optimization.
-    """
     with fits.open(path, memmap=False) as hdul:
         data = np.asarray(hdul[0].data, dtype=float)
         header = hdul[0].header
@@ -493,18 +368,8 @@ def process_bcd_file(path: Path):
     return df, summary
 
 
-# -------------------------------------------------------------------------
-# Lewis-style flux outlier clipping
-# -------------------------------------------------------------------------
-
 def clip_outliers(flux: np.ndarray, window_points: int = MOVING_MEDIAN_WIDTH,
                   sigma_threshold: float = SIGMA_OUTLIER) -> np.ndarray:
-    """
-    Lewis-style photometric clipping.
-
-    Reject points more than sigma_threshold * robust_std from a window_points
-    moving median in flux.
-    """
     flux = np.asarray(flux, dtype=float)
     local_med = moving_median(flux, window_points)
     resid = flux - local_med
@@ -518,11 +383,6 @@ def clip_outliers(flux: np.ndarray, window_points: int = MOVING_MEDIAN_WIDTH,
         & np.isfinite(resid)
         & (np.abs(resid) <= sigma_threshold * sig)
     )
-
-
-# -------------------------------------------------------------------------
-# Aperture offset optimization and per-AOR finalization
-# -------------------------------------------------------------------------
 
 def optimize_aperture_offset(df: pd.DataFrame, offsets: Iterable[float]) -> float:
     """
@@ -567,13 +427,6 @@ def optimize_aperture_offset(df: pd.DataFrame, offsets: Iterable[float]) -> floa
 
 
 def finalize_aor_photometry(df: pd.DataFrame, aperture_offset: float) -> pd.DataFrame:
-    """
-    Given a per-AOR DataFrame with images, centroid, and beta,
-    compute aperture_radius, flux_raw, flux_norm_visit, and frame_ok_outlier.
-
-    Outlier clipping is per-visit, based on residuals to a moving median
-    in flux_norm_visit, with SIGMA_OUTLIER threshold.
-    """
     images = df["_image"].tolist()
 
     flux = []
@@ -615,11 +468,6 @@ def finalize_aor_photometry(df: pd.DataFrame, aperture_offset: float) -> pd.Data
     out["frame_ok_outlier"] = keep_out
     return out
 
-
-# -------------------------------------------------------------------------
-# File discovery and AOR metadata
-# -------------------------------------------------------------------------
-
 def discover_files(base_path: Path, aor_whitelist: Optional[set[str]]) -> list[Path]:
     files = sorted(base_path.glob(DEFAULT_GLOB))
     selected = []
@@ -638,17 +486,8 @@ def load_aor_table(path: Optional[Path]) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-# -------------------------------------------------------------------------
-# Segment identification and ramp trimming (Lewis-style)
-# -------------------------------------------------------------------------
 
 def assign_time_segments(photometry: pd.DataFrame, gap_hours: float = SEGMENT_GAP_HOURS) -> pd.DataFrame:
-    """
-    Assign continuous observing-segment IDs from elapsed-time gaps only.
-
-    An AOR boundary is not itself a new segment; segments are purely
-    time-contiguous, matching Lewis/de Wit trimming logic across downlinks.
-    """
     data = photometry.sort_values(
         ["bjd_utc", "aor_id", "fits_file", "cube_index"]
     ).copy()
@@ -666,12 +505,6 @@ def assign_time_segments(photometry: pd.DataFrame, gap_hours: float = SEGMENT_GA
 
 
 def first_hour_keep_mask(photometry: pd.DataFrame, trim_hours: float = TRIM_HOURS) -> np.ndarray:
-    """
-    Keep frames beginning trim_hours after each segment start.
-
-    This is the Lewis/de Wit 4.5 um standard ramp correction: trim the
-    first hour of each observation and each downlink/reacquisition gap.
-    """
     keep = np.ones(len(photometry), dtype=bool)
     trim_days = trim_hours / 24.0
 
@@ -683,11 +516,6 @@ def first_hour_keep_mask(photometry: pd.DataFrame, trim_hours: float = TRIM_HOUR
 
     return keep
 
-
-# -------------------------------------------------------------------------
-# Centroid/beta clipping (new)
-# -------------------------------------------------------------------------
-
 def make_position_beta_mask(
     photometry: pd.DataFrame,
     sigma_pos: float = 5.0,
@@ -695,16 +523,6 @@ def make_position_beta_mask(
     hard_dx: float = 0.30,
     hard_dy: float = 0.30,
 ) -> np.ndarray:
-    """
-    Identify outliers in x_cent, y_cent, and beta, per (aor_id, segment_id).
-
-    Frames are flagged as bad if they are far from the local median in
-    centroid or beta, even if their flux looks fine. This removes the
-    repeating vertical spikes seen in the diagnostic plots without
-    touching the main trends.
-
-    Returns a boolean mask `frame_ok_posbeta`.
-    """
     mask = np.ones(len(photometry), dtype=bool)
 
     for (_, _), group in photometry.groupby(["aor_id", "segment_id"], sort=False):
@@ -746,27 +564,7 @@ def make_position_beta_mask(
 
     return mask
 
-
-# -------------------------------------------------------------------------
-# Phase 1 outputs + diagnostic plotting
-# -------------------------------------------------------------------------
-
 def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optional[Path], allow_all: bool = False):
-    """
-    Main Phase 1 pipeline:
-
-      - loads or constructs the AOR table,
-      - discovers matching BCD files for the selected AORs,
-      - processes cubes into per-file DataFrames (Lewis-style),
-      - optimizes aperture offsets per AOR (de Wit-style),
-      - finalizes per-AOR photometry (flux_raw, flux_norm_visit, frame_ok_outlier),
-      - concatenates all AORs,
-      - identifies continuous segments and trims first hour in each (ramp correction),
-      - clips centroid/beta outliers per AOR+segment,
-      - builds a campaign-wide flux_norm_global from trimmed, non-outlier frames,
-      - writes photometry, AOR summary, file summary, manifest,
-      - makes a four-panel diagnostic plot.
-    """
     aor_table = load_aor_table(aor_table_path)
     if len(aor_table) == 0 and not allow_all:
         raise RuntimeError(
@@ -978,21 +776,6 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
 
 
 def make_phase1_diag_plot(phot: pd.DataFrame, output_dir: Path):
-    """
-    Four-panel diagnostic figure:
-
-      (a) x centroid vs observation time from first retained point,
-      (b) y centroid,
-      (c) noise-pixel beta,
-      (d) globally normalized relative flux (flux_norm_global),
-          with a dashed line at 1.0.
-
-    Uses only frame_ok points, with time in hours relative to the earliest
-    retained BJD_UTC. Ramp trimming (first hour per segment) and centroid/beta
-    clipping are already encoded in frame_ok, so panel (d) matches the Lewis
-    4.5 um behavior when zoomed to the 2011 phase-curve subset and panels
-    (a)–(c) are free of repeated extreme outliers.
-    """
     kept = phot[phot["frame_ok"]].copy()
     if kept.empty:
         print("No frame_ok points; skipping diagnostic plot.")
@@ -1097,11 +880,6 @@ def make_phase1_diag_plot(phot: pd.DataFrame, output_dir: Path):
     plt.show()
     plt.close(fig)
     print(f"Saved diagnostic figure: {out_path}")
-
-
-# -------------------------------------------------------------------------
-# CLI and main
-# -------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(

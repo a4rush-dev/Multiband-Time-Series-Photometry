@@ -7,7 +7,6 @@ import batman
 from astropy.timeseries import LombScargle
 import json
 
-# ========== LOAD DATA ==========
 df = pd.read_csv("hatp2_tess_lightcurve.csv")
 t = np.array(df["time"])
 f = np.array(df["flux"])
@@ -22,7 +21,6 @@ ferr = ferr / median_flux
 
 period = 5.6334729
 
-# ========== LOAD TRANSIT PARAMETERS ==========
 with open("tess_params.json", "r") as f_json:
     params_dict = json.load(f_json)
 
@@ -32,7 +30,6 @@ rp = params_dict["rp"]
 a = params_dict["a"]
 inc = params_dict["inc"]
 
-# ========== BUILD TRANSIT MODEL ==========
 params = batman.TransitParams()
 params.t0 = 0.0
 params.per = period
@@ -58,14 +55,12 @@ best = np.array([t0_rel, rp, a, inc])
 transit_model = model(best, t - t0_est)
 residuals = f - transit_model + 1.0
 
-# ========== LOMB-SCARGLE ==========
 ls = LombScargle(t, residuals, ferr, center_data=True)
 frequency, power = ls.autopower(minimum_frequency=0.01, maximum_frequency=20, samples_per_peak=10)
 
 best_freq = frequency[np.argmax(power)]
 print(f"Best frequency: {best_freq:.6f} d⁻¹")
 
-# ========== PHASE DATA & GET MODEL ==========
 phase = (best_freq * t) % 1.0
 sort_idx = np.argsort(phase)
 
@@ -76,7 +71,6 @@ residuals_sorted = residuals[sort_idx]
 t_phase = np.linspace(0, 1/best_freq, 1000)
 y_fit = ls.model(t_phase, best_freq)
 
-# ========== PLOT: JUST PHASED DATA + MODEL ==========
 fig, ax = plt.subplots(figsize=(8, 6))
 
 # Blue dots: phased data

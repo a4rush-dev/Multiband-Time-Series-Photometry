@@ -24,7 +24,6 @@ ferr = ferr / median_flux
 # known period (HAT-P-2b)
 period = 5.6334729
 
-# === quick grid search to estimate t0 ===
 ntrial = 1200
 trial_offsets = np.linspace(0, period, ntrial)
 window_phase = 0.02
@@ -58,7 +57,6 @@ t_win = t_win[order]
 f_win = f_win[order]
 ferr_win = ferr_win[order]
 
-# === batman setup ===
 params = batman.TransitParams()
 params.t0 = 0.0
 params.per = period
@@ -97,7 +95,6 @@ def log_prob(theta, t_rel, f_rel, ferr_rel):
         return -np.inf
     return lp + log_likelihood(theta, t_rel, f_rel, ferr_rel)
 
-# === run emcee ===
 ndim = 4
 nwalkers = 24
 init = np.array([0.0, 0.0722, 8.9, 86.3])
@@ -109,7 +106,6 @@ sampler.run_mcmc(pos, 1000, progress=True)
 
 flat = sampler.get_chain(discard=200, thin=5, flat=True)
 
-# === best fit ===
 best = np.median(flat, axis=0)
 t0_rel, rp, a, inc = best
 

@@ -4,9 +4,6 @@ import batman
 import emcee
 from scipy.stats import skew, kurtosis
 
-# -------------------------
-# Load data
-# -------------------------
 INPUT_TXT = "full_LC_stel_puls_orb_params.txt"
 
 data = np.loadtxt(INPUT_TXT)
@@ -17,9 +14,6 @@ flux_err = data[2,:]
 t_rel = time - time[0]
 flux_norm = flux + 1.0
 
-# -------------------------
-# CHECK THE ERRORS
-# -------------------------
 print(f"median flux_err: {np.median(flux_err):.2e}")
 print(f"std of flux outside transit (t>0.3): {np.std(flux_norm[t_rel > 0.3]):.2e}")
 
@@ -30,18 +24,13 @@ if out_of_transit_std > 3 * np.median(flux_err):
     print("inflating errors to match actual scatter")
     flux_err = np.sqrt(flux_err**2 + (out_of_transit_std * 0.5)**2)
 
-# -------------------------
-# Planet flux model
-# -------------------------
+
 def planet_flux_model(t, Fp_Fsmin, c1, c2, c3, c4, c5, c6):
     u = np.where(t < c2, (t - c2) / c3, (t - c2) / c4)
     eclipse = (t > (c5 - 0.5*c6)) & (t < (c5 + 0.5*c6))
     model = np.where(eclipse, 0.0, Fp_Fsmin + c1/(u**2 + 1.0))
     return model
 
-# -------------------------
-# Batman setup
-# -------------------------
 period = 5.6334729
 base_params = batman.TransitParams()
 base_params.per = period
@@ -65,9 +54,6 @@ def model(theta, t_arr):
     
     return transit + planet - Fp_Fsmin
 
-# -------------------------
-# MCMC setup
-# -------------------------
 def log_likelihood(theta, t_arr, f_arr, ferr_arr):
     model_flux = model(theta, t_arr)
     residuals = (f_arr - model_flux) / ferr_arr
@@ -97,9 +83,6 @@ def log_prob(theta, t_arr, f_arr, ferr_arr):
         return -np.inf
     return lp + log_likelihood(theta, t_arr, f_arr, ferr_arr)
 
-# -------------------------
-# Initial guess with BIGGER c1
-# -------------------------
 init = np.array([0.14, 0.070, 8.9, 86.3, 0.2, 0.3, 
                  0.00005, 0.0005, 1.05, 1.5, 0.2, 1.23, 0.11])
 
@@ -113,9 +96,6 @@ print("\nrunning mcmc with adjusted errors...")
 sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob, args=(t_rel, flux_norm, flux_err))
 sampler.run_mcmc(pos, nsteps, progress=True)
 
-# -------------------------
-# Results
-# -------------------------
 flat = sampler.get_chain(discard=800, thin=15, flat=True)
 best = np.median(flat, axis=0)
 
@@ -127,9 +107,7 @@ reduced_chi2 = chi2 / (len(flux_norm) - ndim)
 res_skew = skew(residuals / flux_err)
 res_kurt = kurtosis(residuals / flux_err)
 
-# -------------------------
-# Plot
-# -------------------------
+
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True, 
                                 gridspec_kw={'height_ratios': [3, 1]})
 

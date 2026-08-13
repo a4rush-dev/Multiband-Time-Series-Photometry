@@ -22,7 +22,6 @@ ferr = ferr / median_flux
 
 period = 5.6334729
 
-# === quick grid search to estimate t0 ===
 ntrial = 1200
 trial_offsets = np.linspace(0, period, ntrial)
 window_phase = 0.02
@@ -55,7 +54,6 @@ t_win = t_win[order]
 f_win = f_win[order]
 ferr_win = ferr_win[order]
 
-# ========== LOAD PARAMETERS FROM JSON ==========
 if not os.path.exists("tess_params.json"):
     raise RuntimeError("tess_params.json not found! Run your MCMC script to create it.")
 

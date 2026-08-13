@@ -32,7 +32,6 @@ LIMB_DARKENING_COEFFS = [0.12, 0.34, 0.20, 0.10]
 
 
 def mad_std(x: np.ndarray) -> float:
-    """Robust standard deviation from MAD."""
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -46,11 +45,6 @@ def mad_std(x: np.ndarray) -> float:
 def phase_fold(bjd: np.ndarray,
                period: float = P_ORB,
                t0: float = T0_TRANSIT) -> np.ndarray:
-    """
-    Phase-fold BJD onto [-0.5, 0.5] with phase 0 at mid-transit.
-
-    This matches de Wit’s convention for Fig. 1.
-    """
     ph = ((np.asarray(bjd, dtype=float) - t0) / period) % 1.0
     ph = np.where(ph > 0.5, ph - 1.0, ph)
     return ph
@@ -59,12 +53,6 @@ def phase_fold(bjd: np.ndarray,
 def bin_phase(phase: np.ndarray,
               flux: np.ndarray,
               bin_width: float = DEFAULT_BIN_WIDTH) -> pd.DataFrame:
-    """
-    Bin flux as a function of orbital phase.
-
-    Bins cover [-0.5, 0.5] with width bin_width; reports median flux,
-    robust error per bin, and n_points.
-    """
     phase = np.asarray(phase, dtype=float)
     flux = np.asarray(flux, dtype=float)
 
@@ -101,14 +89,6 @@ def time_of_periastron(t0_bjd: float,
                        period_days: float,
                        e: float,
                        omega_deg: float) -> float:
-    """
-    Approximate time of periastron passage from mid-transit time using
-    Lewis/de Wit geometry.
-
-    Transit roughly corresponds to argument-of-latitude
-    Invert for f_transit, then compute mean anomaly and Δt between
-    periastron (M=0) and transit.
-    """
     omega = np.deg2rad(omega_deg)
     f_tr = (0.5 * np.pi) - omega
 
@@ -128,12 +108,6 @@ def asymmetric_lorentzian_flux_param(t_bjd: np.ndarray,
                                      t_peak_hr: float,
                                      tau_rise_hr: float,
                                      tau_decay_hr: float) -> np.ndarray:
-    """
-    Asymmetric Lorentzian transient-heating phase curve at 4.5 μm
-    with free parameters.
-
-    Returns planet/star flux ratio in ppm.
-    """
     t_bjd = np.asarray(t_bjd, dtype=float)
     delta_t_hr = (t_bjd - t_peri_bjd) * 24.0
 
@@ -153,14 +127,6 @@ def asymmetric_lorentzian_flux_param(t_bjd: np.ndarray,
 
 
 def fixed_phase_model_flux(t_bjd: np.ndarray) -> np.ndarray:
-    """
-    Fixed astrophysical phase curve model using de Wit global-fit values.
-
-    F_model(t) = 1.0 + (planet_flux_ppm / 1e6)
-
-    No explicit transit/occultation shape; transits/occultations remain
-    in the data. This is used ONLY for intrapixel mapping.
-    """
     t_bjd = np.asarray(t_bjd, dtype=float)
     t_peri = time_of_periastron(T0_TRANSIT, P_ORB, ECC, OMEGA_DEG)
     phase_ppm = asymmetric_lorentzian_flux_param(
@@ -175,7 +141,6 @@ def fixed_phase_model_flux(t_bjd: np.ndarray) -> np.ndarray:
     return 1.0 + phase_ppm / 1e6
 
 def make_transit_params() -> batman.TransitParams:
-    """Create fixed BATMAN transit parameters for HAT-P-2b."""
     params = batman.TransitParams()
     params.t0 = T0_TRANSIT
     params.per = P_ORB
@@ -190,7 +155,6 @@ def make_transit_params() -> batman.TransitParams:
 
 
 def batman_transit_flux(time_bjd: np.ndarray) -> np.ndarray:
-    """Primary transit light curve."""
     params = make_transit_params()
     exposure_days = 0.4 / 86400.0
     model = batman.TransitModel(
@@ -203,11 +167,6 @@ def batman_transit_flux(time_bjd: np.ndarray) -> np.ndarray:
 
 
 def eclipse_visibility(time_bjd: np.ndarray) -> np.ndarray:
-    """
-    Planet visibility during secondary eclipse.
-
-    1 means fully visible; 0 means fully eclipsed.
-    """
     params = make_transit_params()
 
     omega = np.deg2rad(OMEGA_DEG)
@@ -236,12 +195,6 @@ def eclipse_visibility(time_bjd: np.ndarray) -> np.ndarray:
 
 def system_model_flux(t_bjd: np.ndarray,
                       theta_phase: np.ndarray) -> np.ndarray:
-    """
-    Full system model:
-        F_system(t) = F_transit_star(t) * [1 + F_planet_ppm(t) * visibility(t) / 1e6]
-
-    Transit/occultation geometry fixed; Lorentzian planet parameters free.
-    """
     t_bjd = np.asarray(t_bjd, dtype=float)
 
     # Stellar transit
@@ -280,11 +233,6 @@ def weighted_mean(values: np.ndarray,
 def build_ip_sensitivity_map(x_cent: np.ndarray,
                              y_cent: np.ndarray,
                              detector_ratio: np.ndarray) -> np.ndarray:
-    """
-    Leave-one-out local Gaussian intrapixel sensitivity map.
-
-    detector_ratio = flux_norm_global / fixed_model.
-    """
     x_cent = np.asarray(x_cent, dtype=float)
     y_cent = np.asarray(y_cent, dtype=float)
     detector_ratio = np.asarray(detector_ratio, dtype=float)
@@ -349,12 +297,6 @@ def apply_ip_correction(flux_global: np.ndarray,
                         fixed_model: np.ndarray,
                         x_cent: np.ndarray,
                         y_cent: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Construct and apply the non-parametric intrapixel map.
-
-    Starts directly from flux_norm_global (Phase 1), with no extra
-    per-AOR/segment renormalization.
-    """
     flux_global = np.asarray(flux_global, dtype=float)
     fixed_model = np.asarray(fixed_model, dtype=float)
     x_cent = np.asarray(x_cent, dtype=float)
@@ -379,12 +321,6 @@ def log_likelihood_theta(theta: np.ndarray,
                          phase: np.ndarray,
                          flux: np.ndarray,
                          flux_err: np.ndarray) -> float:
-    """
-    Likelihood for Lorentzian parameters plus jitter.
-
-    theta = [F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr,
-             log_sigma_ppm]
-    """
     F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, log_sigma_ppm = theta
 
     t_bjd = T0_TRANSIT + phase * P_ORB
@@ -403,9 +339,6 @@ def log_likelihood_theta(theta: np.ndarray,
 
 
 def log_prior_theta(theta: np.ndarray) -> float:
-    """
-    Priors centered on de Wit global-fit values.
-    """
     F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, log_sigma_ppm = theta
 
     if not (0.0 < F_min_ppm < 2000.0):
@@ -440,11 +373,6 @@ def run_emcee_lorentzian(phase: np.ndarray,
                          n_walkers: int = 48,
                          n_steps: int = 3000,
                          burnin: int = 1500) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Run EMCEE on Lorentzian + transit/eclipse parameters using binned data.
-
-    Returns chain (flattened) and MAP estimate.
-    """
     init_F_min = PHASE_MIN_PPM
     init_F_peak = PHASE_PEAK_PPM
     init_t_peak = PHASE_PEAK_OFFSET_HR
@@ -491,13 +419,6 @@ def plot_fig1_style(df: pd.DataFrame,
                     binned: pd.DataFrame,
                     theta_map: np.ndarray,
                     outprefix: str) -> None:
-    """
-    Make de Wit Figure 1-style plots:
-
-    - Panel A: full phase curve (binned points + green model).
-    - Panel B: transit zoom (~phase 0).
-    - Panel C: occultation zoom (~phase_occ).
-    """
     outprefix = Path(outprefix)
 
     phase_b = binned["phase_center"].to_numpy(dtype=float)

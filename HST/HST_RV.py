@@ -1,8 +1,6 @@
 import os
 
-# ---------------------------
 # Make RadVel happy on Windows
-# ---------------------------
 if "HOME" not in os.environ:
     os.environ["HOME"] = os.environ.get("USERPROFILE", os.path.expanduser("~"))
 
@@ -17,10 +15,6 @@ from scipy.stats import skew, kurtosis
 import warnings
 warnings.filterwarnings("ignore")
 
-
-# =====================================================
-# CONSTANTS
-# =====================================================
 PERIOD   = 5.6334729
 TC_REF   = 2454529.674
 E_LIT    = 0.502
@@ -45,10 +39,6 @@ def e_omega_from_se(secosw_val, sesinw_val):
 def phase_fold(t, tc_use, per_use):
     return np.mod((t - tc_use) / per_use, 1.0)
 
-
-# =====================================================
-# LOAD RV DATA
-# =====================================================
 rv_data = np.loadtxt("hat_p2_rv.txt")
 t_rv    = rv_data[:, 0] + 2450000.0
 rv_all  = rv_data[:, 1]
@@ -61,10 +51,6 @@ mask_harpsn = (inst_id == 1)
 time_base = np.median(t_rv)
 t_rel_rv  = t_rv - time_base
 
-
-# =====================================================
-# LOAD HST DATA
-# =====================================================
 INPUT_TXT = "full_LC_stel_puls_orb_params.txt"
 hst_data = np.loadtxt(INPUT_TXT)
 
@@ -96,10 +82,6 @@ if out_of_transit_std > 3 * np.median(ferr_hst):
     print("WARNING: HST flux scatter >> quoted flux_err, inflating uncertainties")
     ferr_hst = np.sqrt(ferr_hst**2 + (0.5 * out_of_transit_std)**2)
 
-
-# =====================================================
-# IDENTIFY HST ORBITS FROM TIME GAPS
-# =====================================================
 dt_hst = np.diff(t_hst_rel)
 gap_thresh = max(5.0 * np.median(dt_hst), 0.015)
 
@@ -116,10 +98,6 @@ n_hst_orbits = len(orbit_starts)
 print(f"\nIdentified {n_hst_orbits} HST orbit chunks")
 print(f"gap threshold = {gap_thresh:.5f} days")
 
-
-# =====================================================
-# INITIAL RV-ONLY FIT
-# =====================================================
 params_static = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_static["per1"]    = radvel.Parameter(value=PERIOD, vary=False)
 params_static["tc1"]     = radvel.Parameter(value=TC_REF, vary=True)
@@ -164,20 +142,12 @@ print("\nRV-only initialization:")
 print(f"  tc1_init = {tc1_init:.6f}")
 print(f"  k1_init  = {k1_init:.3f}")
 
-
-# =====================================================
-# HST / RV EPOCH LINK
-# =====================================================
 t0_rel_guess = 0.14
 t0_hst_bjd_guess = time_hst_bjd[0] + t0_rel_guess
 N_hst = int(np.round((t0_hst_bjd_guess - tc1_init) / PERIOD))
 
 print(f"\nNearest HST orbit count from RV tc1: N_hst = {N_hst}")
 
-
-# =====================================================
-# JOINT RV MODEL
-# =====================================================
 params_joint = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_joint["per1"]    = radvel.Parameter(value=PERIOD, vary=False)
 params_joint["tc1"]     = radvel.Parameter(value=tc1_init, vary=True)
@@ -200,21 +170,12 @@ params_joint["g2"] = radvel.Parameter(value=0.0, vary=True, linear=True)
 mod_joint = radvel.RVModel(params_joint)
 mod_joint.time_base = time_base
 
-
-# =====================================================
-# BATMAN BASE PARAMS
-# =====================================================
 base_params = batman.TransitParams()
 base_params.per = PERIOD
 base_params.ecc = E_LIT
 base_params.w   = WDEG_LIT
 base_params.limb_dark = "quadratic"
 
-
-# =====================================================
-# HST PLANET FLUX MODEL
-# IMPORTANT: keep c2,c3,c4,c5,c6 on original visit axis
-# =====================================================
 def planet_flux_model(t_rel, Fp_Fsmin, c1, c2, c3, c4, c5, c6):
     u = np.where(t_rel < c2, (t_rel - c2) / c3, (t_rel - c2) / c4)
     eclipse = (t_rel > (c5 - 0.5 * c6)) & (t_rel < (c5 + 0.5 * c6))
@@ -222,7 +183,6 @@ def planet_flux_model(t_rel, Fp_Fsmin, c1, c2, c3, c4, c5, c6):
     return model
 
 
-# =====================================================
 # PARAMETER VECTOR
 # theta = [
 #   tc1, k1, secosw1, sesinw1,
@@ -235,7 +195,6 @@ def planet_flux_model(t_rel, Fp_Fsmin, c1, c2, c3, c4, c5, c6):
 #   Fp_Fsmin, c1, c2, c3, c4, c5, c6,
 #   ln_jit_hst
 # ]
-# =====================================================
 def theta_initial():
     return np.array([
         tc1_init,
@@ -300,10 +259,6 @@ def theta_to_params(theta):
 
     return e_val, omega_val
 
-
-# =====================================================
-# HST BASE ASTRO MODEL (no orbit offsets yet)
-# =====================================================
 def hst_base_model(theta, t_rel_arr):
     (tc1, k1, secosw1, sesinw1,
      gamma_hires, gamma_harpsn,
@@ -330,10 +285,6 @@ def hst_base_model(theta, t_rel_arr):
 
     return transit + planet - Fp_Fsmin + visit_baseline
 
-
-# =====================================================
-# SOLVE PER-ORBIT HST OFFSETS ANALYTICALLY
-# =====================================================
 def hst_full_model_and_offsets(theta):
     base_model = hst_base_model(theta, t_hst_rel)
 
@@ -362,10 +313,6 @@ def hst_full_model_and_offsets(theta):
 
     return model, sigma_hst, orbit_offsets, ln_prior_offsets
 
-
-# =====================================================
-# LIKELIHOODS
-# =====================================================
 def rv_log_likelihood(theta):
     theta_to_params(theta)
     rv_planet = mod_joint(t_rv)
@@ -409,9 +356,6 @@ def hst_log_likelihood(theta):
     return lnL_data + ln_prior_offsets
 
 
-# =====================================================
-# PRIORS
-# =====================================================
 def log_prior(theta):
     (tc1, k1, secosw1, sesinw1,
      gamma_hires, gamma_harpsn,
@@ -523,9 +467,6 @@ def log_prob(theta, alpha_hst=1.0):
     return lp + rv_log_likelihood(theta) + alpha_hst * hst_log_likelihood(theta)
 
 
-# =====================================================
-# RUN EMCEE
-# =====================================================
 theta_start = theta_initial()
 ndim = len(theta_start)
 nwalkers = 64
@@ -591,10 +532,6 @@ jit_hst_med    = np.exp(ln_jit_hst_med)
 e_med, omega_med = e_omega_from_se(secosw_med, sesinw_med)
 
 theta_to_params(theta_med)
-
-# =====================================================
-# DIAGNOSTICS
-# =====================================================
 
 # RV diagnostics
 rv_planet_med = mod_joint(t_rv)
@@ -669,11 +606,6 @@ print(f"RV-pred BJD      = {t_trans_rv_pred_med:.6f}")
 print(f"timing offset    = {dt_link_med:.6f} days")
 
 
-# =====================================================
-# PLOTS
-# =====================================================
-
-# RV phase-folded plot
 phase_rv = phase_fold(t_rv, tc1_med, PERIOD)
 phase_all_rv = np.concatenate([phase_rv, phase_rv + 1.0])
 rv_all_2  = np.concatenate([rv_all, rv_all])
@@ -713,7 +645,6 @@ ax_rv[1].grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# HST plot
 fig_hst, (ax1, ax2) = plt.subplots(
     2, 1, figsize=(14, 7), sharex=True,
     gridspec_kw={"height_ratios": [3, 1]}
@@ -735,7 +666,6 @@ ax2.set_ylabel("Residuals")
 plt.tight_layout()
 plt.show()
 
-# Optional: inspect recovered orbit offsets
 plt.figure(figsize=(8, 4))
 plt.axhline(0, color="k", lw=1)
 plt.plot(np.arange(n_hst_orbits), orbit_offsets_med, "o-")

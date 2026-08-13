@@ -15,10 +15,6 @@ warnings.filterwarnings('ignore')
 
 import emcee
 
-# =====================================================
-# LOAD DATA: hat_p2_rv.txt
-# BJD-2450000  RV(m/s)  e_RV(m/s)  inst (0=HIRES, 1=HARPS-N)
-# =====================================================
 data = np.loadtxt("hat_p2_rv.txt")
 t_all    = data[:, 0] + 2450000.0
 rv_all   = data[:, 1]
@@ -31,7 +27,6 @@ mask_harpsn = (inst_id == 1)
 time_base = np.median(t_all)
 t_rel     = t_all - time_base   # for trends
 
-# ORBITAL CONSTANTS (FROM LITERATURE)
 per   = 5.6334729
 tc    = 2454529.674
 e0    = 0.502
@@ -54,9 +49,6 @@ def phase_fold(t, tc_use, per_use):
 ln_jit_center = np.log(5.0)
 ln_jit_sigma  = 0.7
 
-# =====================================================
-# MODEL 1: STATIC ONE-PLANET
-# =====================================================
 params_static = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_static['per1']    = radvel.Parameter(value=per,    vary=False)
 params_static['tc1']     = radvel.Parameter(value=tc,     vary=True)
@@ -74,7 +66,6 @@ params_static['jit_harpsn']   = radvel.Parameter(value=3.0, vary=True)
 mod_static = radvel.RVModel(params_static)
 mod_static.time_base = time_base
 
-# RadVel maxlike for starting point
 like_hires = rlike.RVLikelihood(
     mod_static, t_all[mask_hires], rv_all[mask_hires], err_all[mask_hires],
     suffix="_hires"
@@ -227,9 +218,7 @@ print(f"chi2_med      = {chi2_static:.2f}")
 print(f"chi2_r_med    = {chi2r_static:.3f}")
 print(f"RMS_all       = {np.std(resid_static):.2f} m/s")
 
-# =====================================================
-# MODEL 2: "EVOLVING" (geometry varies with time)
-# =====================================================
+
 params_evol = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_evol['per1']    = radvel.Parameter(value=per,    vary=False)
 params_evol['tc1']     = radvel.Parameter(value=tc_med_static, vary=True)
@@ -290,11 +279,10 @@ def log_prior_evol(theta):
     if not (np.log(0.5) < ln_jit_harpsn < np.log(30.0)):
         return -np.inf
 
-    # e in (0,1); secosw/sesinw close to literature values
     e_val, omega_val = e_omega_from_se(secosw1, sesinw1)
     if not (0.0 < e_val < 0.999):
         return -np.inf
-    # very tight priors to prevent pathological e, ω
+    
     sige = 0.02
     sigw = np.deg2rad(5.0)
     lp  = -0.5 * ((tc1 - tc0)**2 / sigtc**2 + np.log(2.0 * np.pi * sigtc**2))
@@ -393,9 +381,6 @@ print(f"chi2_med      = {chi2_evol:.2f}")
 print(f"chi2_r_med    = {chi2r_evol:.3f}")
 print(f"RMS_all       = {np.std(resid_evol):.2f} m/s")
 
-# =====================================================
-# MODEL 3: QUADRATIC-TREND ONE-PLANET
-# =====================================================
 params_quad = radvel.Parameters(1, basis="per tc secosw sesinw k")
 params_quad['per1']    = radvel.Parameter(value=per,    vary=False)
 params_quad['tc1']     = radvel.Parameter(value=tc_med_static, vary=True)
@@ -569,9 +554,6 @@ print(f"chi2_med      = {chi2_quad:.2f}")
 print(f"chi2_r_med    = {chi2r_quad:.3f}")
 print(f"RMS_all       = {np.std(resid_quad):.2f} m/s")
 
-# =====================================================
-# PHASE-FOLDED PLOTS FOR ALL THREE MODELS
-# =====================================================
 def make_phase_plot(name, tc_med, rv_model_med, resid_med, tc_curve_med, mod_obj,
                     gamma_for_curve, extra_trend=None, filename="out.png"):
     phase = phase_fold(t_all, tc_med, per)
