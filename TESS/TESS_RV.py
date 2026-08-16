@@ -1,8 +1,10 @@
 import os
 
+
 # Make RadVel happy on Windows
 if 'HOME' not in os.environ:
     os.environ['HOME'] = os.environ.get('USERPROFILE', os.path.expanduser('~'))
+
 
 import numpy as np
 import pandas as pd
@@ -318,7 +320,6 @@ def tess_model(theta, t_bjd_window):
     )
     return m.light_curve(bat_params)
 
-
 def tess_log_likelihood(theta):
     delta_t, ln_jit_tess = theta_to_params(theta)
 
@@ -330,7 +331,6 @@ def tess_log_likelihood(theta):
 
     lnL_tess = -0.5 * np.sum(resid**2 + np.log(2*np.pi*sigma_tess**2))
     return lnL_tess
-
 
 def log_prior(theta):
     (tc1, k1, secosw1, sesinw1,
@@ -403,7 +403,6 @@ def log_prior(theta):
 
     return lp
 
-
 def log_prob(theta, alpha_tess=1.0):
     lp = log_prior(theta)
     if not np.isfinite(lp):
@@ -412,170 +411,174 @@ def log_prob(theta, alpha_tess=1.0):
     lnL_tess = tess_log_likelihood(theta)
     return lp + lnL_rv + alpha_tess * lnL_tess
 
-theta_start = theta_initial()
-ndim_joint  = len(theta_start)
-nwalkers    = 40
+def main() -> None:
+    theta_start = theta_initial()
+    ndim_joint  = len(theta_start)
+    nwalkers    = 40
 
-scatter = np.array([
-    1e-3,  # tc1
-    5.0,   # k1
-    1e-3,  # secosw1
-    1e-3,  # sesinw1
-    5.0,   # gamma_hires
-    5.0,   # gamma_harpsn
-    0.1,   # ln_jit_hires
-    0.1,   # ln_jit_harpsn
-    0.01,  # g1
-    1e-5,  # g2
-    1e-3,  # delta_t
-    0.5,   # ln_jit_tess
-    1e-3,  # rp
-    1e-3,  # a
-    0.1    # inc
-])
-assert scatter.shape[0] == ndim_joint
+    scatter = np.array([
+        1e-3,  # tc1
+        5.0,   # k1
+        1e-3,  # secosw1
+        1e-3,  # sesinw1
+        5.0,   # gamma_hires
+        5.0,   # gamma_harpsn
+        0.1,   # ln_jit_hires
+        0.1,   # ln_jit_harpsn
+        0.01,  # g1
+        1e-5,  # g2
+        1e-3,  # delta_t
+        0.5,   # ln_jit_tess
+        1e-3,  # rp
+        1e-3,  # a
+        0.1    # inc
+    ])
+    assert scatter.shape[0] == ndim_joint
 
-pos0 = theta_start + scatter * np.random.randn(nwalkers, ndim_joint)
+    pos0 = theta_start + scatter * np.random.randn(nwalkers, ndim_joint)
 
-sampler = emcee.EnsembleSampler(
-    nwalkers, ndim_joint, log_prob, kwargs={"alpha_tess": 0.5}
-)
+    sampler = emcee.EnsembleSampler(
+        nwalkers, ndim_joint, log_prob, kwargs={"alpha_tess": 0.5}
+    )
 
-print("\nJOINT RV+TESS: burn-in...")
-sampler.run_mcmc(pos0, 4000, progress=True)
-sampler.reset()
-print("JOINT RV+TESS: production...")
-sampler.run_mcmc(None, 8000, progress=True)
+    print("\nJOINT RV+TESS: burn-in...")
+    sampler.run_mcmc(pos0, 4000, progress=True)
+    sampler.reset()
+    print("JOINT RV+TESS: production...")
+    sampler.run_mcmc(None, 8000, progress=True)
 
-flat = sampler.get_chain(thin=10, flat=True)
-theta_med = np.percentile(flat, 50, axis=0)
-delta_t_med, ln_jit_tess_med = theta_to_params(theta_med)
+    flat = sampler.get_chain(thin=10, flat=True)
+    theta_med = np.percentile(flat, 50, axis=0)
+    delta_t_med, ln_jit_tess_med = theta_to_params(theta_med)
 
-(tc1_med, k1_med, secosw_med, sesinw_med,
- gamma_hires_med, gamma_harpsn_med,
- ln_jit_hires_med, ln_jit_harpsn_med,
- g1_med, g2_med,
- delta_t_med, ln_jit_tess_med,
- rp_med, a_med, inc_med) = theta_med
+    (tc1_med, k1_med, secosw_med, sesinw_med,
+     gamma_hires_med, gamma_harpsn_med,
+     ln_jit_hires_med, ln_jit_harpsn_med,
+     g1_med, g2_med,
+     delta_t_med, ln_jit_tess_med,
+     rp_med, a_med, inc_med) = theta_med
 
-jit_hires_med  = np.exp(ln_jit_hires_med)
-jit_harpsn_med = np.exp(ln_jit_harpsn_med)
-jit_tess_med   = np.exp(ln_jit_tess_med)
-e_med, omega_med = e_omega_from_se(secosw_med, sesinw_med)
+    jit_hires_med  = np.exp(ln_jit_hires_med)
+    jit_harpsn_med = np.exp(ln_jit_harpsn_med)
+    jit_tess_med   = np.exp(ln_jit_tess_med)
+    e_med, omega_med = e_omega_from_se(secosw_med, sesinw_med)
 
-# RV diagnostics
-rv_planet_med = mod_joint(t_rv)
-rv_model_med  = rv_planet_med.copy()
-rv_model_med[mask_hires]  += gamma_hires_med
-rv_model_med[mask_harpsn] += gamma_harpsn_med
-rv_model_med += g1_med * t_rel_rv + g2_med * (t_rel_rv**2)
+    # RV diagnostics
+    rv_planet_med = mod_joint(t_rv)
+    rv_model_med  = rv_planet_med.copy()
+    rv_model_med[mask_hires]  += gamma_hires_med
+    rv_model_med[mask_harpsn] += gamma_harpsn_med
+    rv_model_med += g1_med * t_rel_rv + g2_med * (t_rel_rv**2)
 
-resid_rv = rv_all - rv_model_med
-sigma_hires_med  = np.sqrt(err_rv[mask_hires]**2  + jit_hires_med**2)
-sigma_harpsn_med = np.sqrt(err_rv[mask_harpsn]**2 + jit_harpsn_med**2)
-chi2_rv = (np.sum((resid_rv[mask_hires]  / sigma_hires_med)**2) +
-           np.sum((resid_rv[mask_harpsn] / sigma_harpsn_med**2)))
-dof_rv   = len(t_rv) - ndim_joint
-chi2r_rv = chi2_rv / dof_rv
+    resid_rv = rv_all - rv_model_med
+    sigma_hires_med  = np.sqrt(err_rv[mask_hires]**2  + jit_hires_med**2)
+    sigma_harpsn_med = np.sqrt(err_rv[mask_harpsn]**2 + jit_harpsn_med**2)
+    chi2_rv = (np.sum((resid_rv[mask_hires]  / sigma_hires_med)**2) +
+               np.sum((resid_rv[mask_harpsn] / sigma_harpsn_med**2)))
+    dof_rv   = len(t_rv) - ndim_joint
+    chi2r_rv = chi2_rv / dof_rv
 
-# TESS diagnostics
-flux_model_med = tess_model(theta_med, t_win_bjd)
-sigma_tess_med = np.sqrt(ferr_win**2 + jit_tess_med**2)
-resid_tess = (f_win - flux_model_med) / sigma_tess_med
-chi2_tess = np.sum(resid_tess**2)
-dof_tess  = len(t_win_bjd) - 5   # tc1, delta_t, ln_jit_tess, rp, a, inc (approx)
-chi2r_tess = chi2_tess / dof_tess
+    # TESS diagnostics
+    flux_model_med = tess_model(theta_med, t_win_bjd)
+    sigma_tess_med = np.sqrt(ferr_win**2 + jit_tess_med**2)
+    resid_tess = (f_win - flux_model_med) / sigma_tess_med
+    chi2_tess = np.sum(resid_tess**2)
+    dof_tess  = len(t_win_bjd) - 5   # tc1, delta_t, ln_jit_tess, rp, a, inc (approx)
+    chi2r_tess = chi2_tess / dof_tess
 
-print("\nJOINT RV+TESS DIAGNOSTICS (shared orbit, epoch-linked)")
-print("=======================================================")
-print(f"tc1           = {tc1_med:.6f}")
-print(f"k1            = {k1_med:.3f} m/s")
-print(f"e             = {e_med:.4f}")
-print(f"omega (deg)   = {np.rad2deg(omega_med):.2f}")
-print(f"gamma_hires   = {gamma_hires_med:.3f} m/s")
-print(f"gamma_harpsn  = {gamma_harpsn_med:.3f} m/s")
-print(f"jit_hires     = {jit_hires_med:.3f} m/s")
-print(f"jit_harpsn    = {jit_harpsn_med:.3f} m/s")
-print(f"g1            = {g1_med:.6f} m/s/day")
-print(f"g2            = {g2_med:.9f} m/s/day^2")
-print(f"N_cycles      = {N_cycles}")
-print(f"delta_t       = {delta_t_med:.6f} days")
-print(f"jit_tess      = {jit_tess_med:.5f} (flux units)")
-print(f"rp            = {rp_med:.6f}")
-print(f"a (a/R*)      = {a_med:.6f}")
-print(f"inc           = {inc_med:.3f} deg")
-print(f"chi2_rv       = {chi2_rv:.2f}  (reduced ~ {chi2r_rv:.3f})")
-print(f"chi2_tess     = {chi2_tess:.2f} (reduced ~ {chi2r_tess:.3f})")
+    print("\nJOINT RV+TESS DIAGNOSTICS (shared orbit, epoch-linked)")
+    print("=======================================================")
+    print(f"tc1           = {tc1_med:.6f}")
+    print(f"k1            = {k1_med:.3f} m/s")
+    print(f"e             = {e_med:.4f}")
+    print(f"omega (deg)   = {np.rad2deg(omega_med):.2f}")
+    print(f"gamma_hires   = {gamma_hires_med:.3f} m/s")
+    print(f"gamma_harpsn  = {gamma_harpsn_med:.3f} m/s")
+    print(f"jit_hires     = {jit_hires_med:.3f} m/s")
+    print(f"jit_harpsn    = {jit_harpsn_med:.3f} m/s")
+    print(f"g1            = {g1_med:.6f} m/s/day")
+    print(f"g2            = {g2_med:.9f} m/s/day^2")
+    print(f"N_cycles      = {N_cycles}")
+    print(f"delta_t       = {delta_t_med:.6f} days")
+    print(f"jit_tess      = {jit_tess_med:.5f} (flux units)")
+    print(f"rp            = {rp_med:.6f}")
+    print(f"a (a/R*)      = {a_med:.6f}")
+    print(f"inc           = {inc_med:.3f} deg")
+    print(f"chi2_rv       = {chi2_rv:.2f}  (reduced ~ {chi2r_rv:.3f})")
+    print(f"chi2_tess     = {chi2_tess:.2f} (reduced ~ {chi2r_tess:.3f})")
 
-# Optional plots
-phase_rv = phase_fold(t_rv, tc1_med, PERIOD)
-phase_all_rv = np.concatenate([phase_rv, phase_rv + 1.0])
-rv_all_2  = np.concatenate([rv_all, rv_all])
-err_rv_2  = np.concatenate([err_rv, err_rv])
-inst_2    = np.concatenate([inst_id, inst_id])
+    # Optional plots
+    phase_rv = phase_fold(t_rv, tc1_med, PERIOD)
+    phase_all_rv = np.concatenate([phase_rv, phase_rv + 1.0])
+    rv_all_2  = np.concatenate([rv_all, rv_all])
+    err_rv_2  = np.concatenate([err_rv, err_rv])
+    inst_2    = np.concatenate([inst_id, inst_id])
 
-mask_hires2  = (inst_2 == 0)
-mask_harpsn2 = (inst_2 == 1)
+    mask_hires2  = (inst_2 == 0)
+    mask_harpsn2 = (inst_2 == 1)
 
-phase_model = np.linspace(0.0, 2.0, 800)
-t_model_phase = tc1_med + phase_model * PERIOD
-rv_planet_curve = mod_joint(t_model_phase)
-rv_curve = rv_planet_curve + gamma_hires_med
-rv_curve += g1_med * (t_model_phase - time_base) + g2_med * (t_model_phase - time_base)**2
+    phase_model = np.linspace(0.0, 2.0, 800)
+    t_model_phase = tc1_med + phase_model * PERIOD
+    rv_planet_curve = mod_joint(t_model_phase)
+    rv_curve = rv_planet_curve + gamma_hires_med
+    rv_curve += g1_med * (t_model_phase - time_base) + g2_med * (t_model_phase - time_base)**2
 
-fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-ax[0].errorbar(phase_all_rv[mask_hires2], rv_all_2[mask_hires2],
-               yerr=err_rv_2[mask_hires2], fmt='o', ms=4, alpha=0.7, label='HIRES')
-ax[0].errorbar(phase_all_rv[mask_harpsn2], rv_all_2[mask_harpsn2],
-               yerr=err_rv_2[mask_harpsn2], fmt='s', ms=4, alpha=0.7, label='HARPS-N')
-ax[0].plot(phase_model, rv_curve, 'k-', lw=1.7, label='Joint median model')
-ax[0].set_ylabel('RV (m/s)')
-ax[0].set_title('HAT-P-2b: joint RV+TESS phase-folded RV')
-ax[0].legend()
-ax[0].grid(alpha=0.3)
+    fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    ax[0].errorbar(phase_all_rv[mask_hires2], rv_all_2[mask_hires2],
+                   yerr=err_rv_2[mask_hires2], fmt='o', ms=4, alpha=0.7, label='HIRES')
+    ax[0].errorbar(phase_all_rv[mask_harpsn2], rv_all_2[mask_harpsn2],
+                   yerr=err_rv_2[mask_harpsn2], fmt='s', ms=4, alpha=0.7, label='HARPS-N')
+    ax[0].plot(phase_model, rv_curve, 'k-', lw=1.7, label='Joint median model')
+    ax[0].set_ylabel('RV (m/s)')
+    ax[0].set_title('HAT-P-2b: joint RV+TESS phase-folded RV')
+    ax[0].legend()
+    ax[0].grid(alpha=0.3)
 
-resid_rv_2 = np.concatenate([resid_rv, resid_rv])
-ax[1].errorbar(phase_all_rv[mask_hires2], resid_rv_2[mask_hires2],
-               yerr=err_rv_2[mask_hires2], fmt='o', ms=4, alpha=0.7)
-ax[1].errorbar(phase_all_rv[mask_harpsn2], resid_rv_2[mask_harpsn2],
-               yerr=err_rv_2[mask_harpsn2], fmt='s', ms=4, alpha=0.7)
-ax[1].axhline(0, color='r', ls='--', lw=1)
-ax[1].set_xlabel('Orbital phase')
-ax[1].set_ylabel('Residuals (m/s)')
-ax[1].grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
+    resid_rv_2 = np.concatenate([resid_rv, resid_rv])
+    ax[1].errorbar(phase_all_rv[mask_hires2], resid_rv_2[mask_hires2],
+                   yerr=err_rv_2[mask_hires2], fmt='o', ms=4, alpha=0.7)
+    ax[1].errorbar(phase_all_rv[mask_harpsn2], resid_rv_2[mask_harpsn2],
+                   yerr=err_rv_2[mask_harpsn2], fmt='s', ms=4, alpha=0.7)
+    ax[1].axhline(0, color='r', ls='--', lw=1)
+    ax[1].set_xlabel('Orbital phase')
+    ax[1].set_ylabel('Residuals (m/s)')
+    ax[1].grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
-# data phases using the window already selected
-phase_win = ((t_win_bjd - t0_tess_bjd_est) / PERIOD) % 1.0
-phase_win = phase_win - np.round(phase_win)
+    # data phases using the window already selected
+    phase_win = ((t_win_bjd - t0_tess_bjd_est) / PERIOD) % 1.0
+    phase_win = phase_win - np.round(phase_win)
 
-phase_window = 0.1
-mask_phase = np.abs(phase_win) < phase_window
+    phase_window = 0.1
+    mask_phase = np.abs(phase_win) < phase_window
 
-# model evaluated on a smooth phase grid
-phase_grid = np.linspace(-phase_window, phase_window, 1000)
+    # model evaluated on a smooth phase grid
+    phase_grid = np.linspace(-phase_window, phase_window, 1000)
 
-# ONE constant shift for the model curve
-phase_shift_model = 0.0045   # try 0.003 to 0.006 if needed
+    # ONE constant shift for the model curve
+    phase_shift_model = 0.0045   # try 0.003 to 0.006 if needed
 
-# build model times from shifted phase grid
-t_grid_bjd = t0_tess_bjd_est + (phase_grid + phase_shift_model) * PERIOD
-flux_grid = tess_model(theta_med, t_grid_bjd)
+    # build model times from shifted phase grid
+    t_grid_bjd = t0_tess_bjd_est + (phase_grid + phase_shift_model) * PERIOD
+    flux_grid = tess_model(theta_med, t_grid_bjd)
 
-fig2, ax2 = plt.subplots(1, 1, figsize=(10, 5))
+    fig2, ax2 = plt.subplots(1, 1, figsize=(10, 5))
 
-ax2.errorbar(phase_win[mask_phase], f_win[mask_phase],
-             yerr=ferr_win[mask_phase],
-             fmt=".k", ms=2, alpha=0.3,
-             label="TESS data (phase-folded, window)")
+    ax2.errorbar(phase_win[mask_phase], f_win[mask_phase],
+                 yerr=ferr_win[mask_phase],
+                 fmt=".k", ms=2, alpha=0.3,
+                 label="TESS data (phase-folded, window)")
 
-ax2.plot(phase_grid, flux_grid, "r", lw=2, label="Joint model")
+    ax2.plot(phase_grid, flux_grid, "r", lw=2, label="Joint model")
 
-ax2.set_xlabel("Orbital phase")
-ax2.set_ylabel("Normalized flux")
-ax2.invert_yaxis()
-ax2.legend()
-ax2.grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
+    ax2.set_xlabel("Orbital phase")
+    ax2.set_ylabel("Normalized flux")
+    ax2.invert_yaxis()
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()

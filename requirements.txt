@@ -1,0 +1,9 @@
+astropy==6.1.7
+Batman==0.7.0
+emcee==3.1.6
+lightkurve==2.6.0
+matplotlib==3.11.1
+numpy==2.5.2
+pandas==3.0.5
+radvel==1.6.1
+scipy==1.18.0
