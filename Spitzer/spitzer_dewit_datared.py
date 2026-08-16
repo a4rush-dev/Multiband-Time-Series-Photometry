@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -13,8 +12,8 @@ import pandas as pd
 from astropy.io import fits
 from scipy.optimize import curve_fit
 
+# TODO: experiment with beta_red
 
-# Default de Wit 4.5 um AOR table (Table 1)
 DEFAULT_DEWIT_AOR_TABLE = [
     {"aor": "42789632", "label": "occultation"},
     {"aor": "42789888", "label": "phase"},
@@ -46,7 +45,6 @@ DEFAULT_DEWIT_AOR_TABLE = [
     {"aor": "57787648", "label": "occultation"},
 ]
 
-# IRAC subarray pattern; expects {AOR}/r{AOR}/ch2/bcd/SPITZER_I2_*_bcd.fits
 DEFAULT_GLOB = "*/r*/ch2/bcd/SPITZER_I2_*_bcd.fits"
 
 FRAME_SHAPE = (32, 32)
@@ -59,20 +57,18 @@ MOVING_MEDIAN_WIDTH = 16
 BACKGROUND_RMIN = 10.0
 CENTROID_R = 3.5
 
-# Grid of aperture offsets (additive term to sqrt(beta))
-APERTURE_R_GRID = np.round(np.arange(-2.50, -1.00 + 1e-9, 0.05), 2)
-APERTURE_R_FLOOR = 1.30
+APERTURE_R_GRID = np.round(np.arange(-1.20, 0.20 + 1e-9, 0.05), 2)
+APERTURE_R_FLOOR = 1.00
 APERTURE_R_CEIL = 3.00
 
-# Lewis/de Wit-style segment handling
 SEGMENT_GAP_HOURS = 1.0
 TRIM_FIRST_HOUR = True
 TRIM_HOURS = 1.0
 
 EXPECTED_AOR_COUNT = 28
-EXPECTED_TOTAL_HOURS_RANGE = (330.0, 370.0)
 
 DIAG_FIGURE_NAME = "phase1_hatp2b_45um_diag.png"
+
 
 def gaussian(x, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
@@ -129,6 +125,7 @@ def fractional_circular_mask(shape, x0, y0, r, sub=8):
     frac /= float(sub * sub)
     return frac
 
+
 def compute_bjd_utc_for_cube(header, n_frames: int):
     mjd0 = get_header_value(header, "MBJD_OBS", "BMJD_OBS")
     if mjd0 is None:
@@ -138,46 +135,19 @@ def compute_bjd_utc_for_cube(header, n_frames: int):
     atimeend = get_header_value(header, "ATIMEEND")
     framtime = float(get_header_value(header, "FRAMTIME", "EXPTIME", default=0.4))
 
-    timing_mode = "mbjd_plus_header_span"
-    warning = ""
-
     if aintbeg is not None and atimeend is not None:
         total = float(atimeend) - float(aintbeg)
         expected = n_frames * framtime
-
         if (not np.isfinite(total)) or total <= 0:
             total = expected
-            timing_mode = "mbjd_plus_framtime_fallback"
-            warning = "Non-positive ATIMEEND-AINTBEG; fell back to FRAMTIME"
-        else:
-            if abs(total - expected) > max(1.0, 0.25 * expected):
-                warning = (
-                    f"Header span differs from n_frames*FRAMTIME: "
-                    f"{total:.6f}s vs {expected:.6f}s"
-                )
         dt = total / n_frames
     else:
         dt = framtime
-        total = n_frames * dt
-        expected = total
-        timing_mode = "mbjd_plus_framtime_fallback"
-        warning = "Missing AINTBEG/ATIMEEND; fell back to FRAMTIME"
 
     mids = (np.arange(n_frames, dtype=float) + 0.5) * dt
     jd_mid = float(mjd0) + mids / 86400.0 + 2400000.5
+    return jd_mid
 
-    timing_meta = {
-        "timing_mode": timing_mode,
-        "timing_anchor_mjd": float(mjd0),
-        "framtime_s": float(framtime),
-        "aintbeg_s": float(aintbeg) if aintbeg is not None else np.nan,
-        "atimeend_s": float(atimeend) if atimeend is not None else np.nan,
-        "header_span_s": float(total),
-        "expected_span_s": float(expected),
-        "span_minus_expected_s": float(total - expected),
-        "timing_warning": warning,
-    }
-    return jd_mid, timing_meta
 
 def estimate_background(image: np.ndarray, rmin: float = BACKGROUND_RMIN) -> float:
     ny, nx = image.shape
@@ -271,41 +241,6 @@ def aperture_radius_from_beta(beta: float, offset: float) -> float:
     r = math.sqrt(beta) + offset
     return float(np.clip(r, APERTURE_R_FLOOR, APERTURE_R_CEIL))
 
-@dataclass
-class FileSummary:
-    aor_id: str
-    fits_file: str
-    n_frames: int
-    n_hotpix_fixed: int
-    bjd_start: float
-    bjd_end: float
-    timing_mode: str
-    framtime_s: float
-    aintbeg_s: float
-    atimeend_s: float
-    header_span_s: float
-    expected_span_s: float
-    span_minus_expected_s: float
-    timing_warning: str
-
-
-@dataclass
-class AORSummary:
-    aor_id: str
-    label: str
-    n_files: int
-    n_frames_raw: int
-    n_frames_kept: int
-    bjd_start: float
-    bjd_end: float
-    duration_hr: float
-    beta_median: float
-    radius_median: float
-    x_median: float
-    y_median: float
-    aperture_offset: float
-    flux_scatter_ppm: float
-
 
 def process_bcd_file(path: Path):
     with fits.open(path, memmap=False) as hdul:
@@ -315,7 +250,7 @@ def process_bcd_file(path: Path):
     if data.ndim != 3 or data.shape[0] != CUBE_LEN or data.shape[1:] != FRAME_SHAPE:
         raise ValueError(f"Unexpected cube shape {data.shape} in {path}")
 
-    bjd, timing_meta = compute_bjd_utc_for_cube(header, data.shape[0])
+    bjd = compute_bjd_utc_for_cube(header, data.shape[0])
     bg = np.array([estimate_background(frame) for frame in data], dtype=float)
     bgsub = data - bg[:, None, None]
     repaired, bad = repair_hot_pixels_cube(bgsub)
@@ -339,59 +274,10 @@ def process_bcd_file(path: Path):
             }
         )
 
-    df = pd.DataFrame(rows)
-    aor = extract_aor_from_path(path)
-    summary = FileSummary(
-        aor_id=aor,
-        fits_file=str(path),
-        n_frames=len(df),
-        n_hotpix_fixed=int(np.count_nonzero(bad)),
-        bjd_start=float(df["bjd_utc"].min()),
-        bjd_end=float(df["bjd_utc"].max()),
-        timing_mode=str(timing_meta["timing_mode"]),
-        framtime_s=float(timing_meta["framtime_s"]),
-        aintbeg_s=float(timing_meta["aintbeg_s"])
-        if np.isfinite(timing_meta["aintbeg_s"])
-        else np.nan,
-        atimeend_s=float(timing_meta["atimeend_s"])
-        if np.isfinite(timing_meta["atimeend_s"])
-        else np.nan,
-        header_span_s=float(timing_meta["header_span_s"])
-        if np.isfinite(timing_meta["header_span_s"])
-        else np.nan,
-        expected_span_s=float(timing_meta["expected_span_s"]),
-        span_minus_expected_s=float(timing_meta["span_minus_expected_s"])
-        if np.isfinite(timing_meta["span_minus_expected_s"])
-        else np.nan,
-        timing_warning=str(timing_meta["timing_warning"]),
-    )
-    return df, summary
+    return pd.DataFrame(rows)
 
-
-def clip_outliers(flux: np.ndarray, window_points: int = MOVING_MEDIAN_WIDTH,
-                  sigma_threshold: float = SIGMA_OUTLIER) -> np.ndarray:
-    flux = np.asarray(flux, dtype=float)
-    local_med = moving_median(flux, window_points)
-    resid = flux - local_med
-    sig = robust_std(resid)
-
-    if not np.isfinite(sig) or sig <= 0:
-        return np.isfinite(flux)
-
-    return (
-        np.isfinite(flux)
-        & np.isfinite(resid)
-        & (np.abs(resid) <= sigma_threshold * sig)
-    )
-
+# TODO: This function can get computationally optimized.
 def optimize_aperture_offset(df: pd.DataFrame, offsets: Iterable[float]) -> float:
-    """
-    Grid search over aperture offsets to minimize the robust std of
-    flux_norm_visit residuals after moving-median detrending.
-
-    This reproduces the behavior in your working Phase 1 script,
-    providing de Wit-style AOR-dependent aperture offsets.
-    """
     best_offset = None
     best_metric = np.inf
 
@@ -468,6 +354,7 @@ def finalize_aor_photometry(df: pd.DataFrame, aperture_offset: float) -> pd.Data
     out["frame_ok_outlier"] = keep_out
     return out
 
+
 def discover_files(base_path: Path, aor_whitelist: Optional[set[str]]) -> list[Path]:
     files = sorted(base_path.glob(DEFAULT_GLOB))
     selected = []
@@ -484,7 +371,6 @@ def load_aor_table(path: Optional[Path]) -> pd.DataFrame:
     if path.suffix.lower() == ".json":
         return pd.DataFrame(json.loads(path.read_text()))
     return pd.read_csv(path)
-
 
 
 def assign_time_segments(photometry: pd.DataFrame, gap_hours: float = SEGMENT_GAP_HOURS) -> pd.DataFrame:
@@ -516,6 +402,7 @@ def first_hour_keep_mask(photometry: pd.DataFrame, trim_hours: float = TRIM_HOUR
 
     return keep
 
+
 def make_position_beta_mask(
     photometry: pd.DataFrame,
     sigma_pos: float = 5.0,
@@ -531,12 +418,10 @@ def make_position_beta_mask(
         y = group["y_cent"].to_numpy(float)
         b = group["beta"].to_numpy(float)
 
-        # Medians
         x0 = np.nanmedian(x)
         y0 = np.nanmedian(y)
         b0 = np.nanmedian(b)
 
-        # Robust scatters
         sx = robust_std(x)
         sy = robust_std(y)
         sb = robust_std(b)
@@ -563,6 +448,7 @@ def make_position_beta_mask(
         mask[idx] = ok
 
     return mask
+
 
 def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optional[Path], allow_all: bool = False):
     aor_table = load_aor_table(aor_table_path)
@@ -600,65 +486,36 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
             )
 
     per_aor = {}
-    file_summaries = []
-
-    # Per-file extraction (Lewis-style)
     for path in files:
-        df, summary = process_bcd_file(path)
-        aor = summary.aor_id
+        df = process_bcd_file(path)
+        aor = extract_aor_from_path(path)
         df["aor_id"] = aor
         df["visit_label"] = aor_meta.get(aor, {}).get("label", "unknown")
         per_aor.setdefault(aor, []).append(df)
-        file_summaries.append(asdict(summary))
 
-    frames = []
-    aor_summaries = []
-
-    # Per-AOR aperture optimization (de Wit-style) and finalization
-    for aor in sorted(per_aor):
-        df = (
+    aor_frames = {}
+    for aor in per_aor:
+        aor_frames[aor] = (
             pd.concat(per_aor[aor], ignore_index=True)
             .sort_values("bjd_utc")
             .reset_index(drop=True)
         )
-        offset = float(aor_meta[aor]["offset"]) if "offset" in aor_meta.get(aor, {}) else optimize_aperture_offset(df, APERTURE_R_GRID)
+
+    visit_order = sorted(aor_frames, key=lambda a: aor_frames[a]["bjd_utc"].min())
+    aor_to_visit_index = {aor: i for i, aor in enumerate(visit_order)}
+
+    frames = []
+    for aor in sorted(aor_frames):
+        df = aor_frames[aor]
+        offset = (
+            float(aor_meta[aor]["offset"])
+            if "offset" in aor_meta.get(aor, {})
+            else optimize_aperture_offset(df, APERTURE_R_GRID)
+        )
         df = finalize_aor_photometry(df, offset)
-        df["visit_index"] = np.arange(len(df), dtype=int)
+        df["visit_index"] = aor_to_visit_index[aor]
         frames.append(df)
 
-        kept_out = df[df["frame_ok_outlier"]].copy()
-        bjd_start = float(df["bjd_utc"].min())
-        bjd_end = float(df["bjd_utc"].max())
-        duration_hr = 24.0 * (bjd_end - bjd_start)
-        flux_scatter_ppm = 1e6 * robust_std(
-            kept_out["flux_norm_visit"].to_numpy(float)
-            - moving_median(
-                kept_out["flux_norm_visit"].to_numpy(float),
-                MOVING_MEDIAN_WIDTH,
-            )
-        )
-        aor_summaries.append(
-            asdict(
-                AORSummary(
-                    aor_id=aor,
-                    label=str(df["visit_label"].iloc[0]),
-                    n_files=int(df["fits_file"].nunique()),
-                    n_frames_raw=int(len(df)),
-                    n_frames_kept=int(kept_out["frame_ok_outlier"].sum()),
-                    bjd_start=bjd_start,
-                    bjd_end=bjd_end,
-                    duration_hr=duration_hr,
-                    beta_median=float(np.nanmedian(df["beta"])),
-                    radius_median=float(np.nanmedian(df["aperture_radius"])),
-                    x_median=float(np.nanmedian(df["x_cent"])),
-                    y_median=float(np.nanmedian(df["y_cent"])),
-                    aperture_offset=float(offset),
-                    flux_scatter_ppm=float(flux_scatter_ppm),
-                )
-            )
-        )
-
-    # Campaign concatenation
     phot = (
         pd.concat(frames, ignore_index=True)
         .sort_values("bjd_utc")
@@ -666,7 +523,6 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
     )
     phot["global_index"] = np.arange(len(phot), dtype=int)
 
-    # Lewis-style segment identification and ramp trimming
     phot = assign_time_segments(phot, gap_hours=SEGMENT_GAP_HOURS)
 
     if TRIM_FIRST_HOUR:
@@ -674,24 +530,20 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
     else:
         phot["frame_ok_trim"] = True
 
-    # Centroid/beta clipping per AOR+segment
     phot["frame_ok_posbeta"] = make_position_beta_mask(phot)
 
-    # Final combined mask
     phot["frame_ok"] = (
         phot["frame_ok_outlier"].to_numpy(bool)
         & phot["frame_ok_trim"].to_numpy(bool)
         & phot["frame_ok_posbeta"].to_numpy(bool)
     )
 
-    # Campaign-wide normalization from trimmed + outlier-clean frames
-    kept = phot[phot["frame_ok"]].copy()
-    global_median = np.nanmedian(kept["flux_raw"])
+    kept = phot[phot["frame_ok"]]
+    global_scale = np.nanmedian(kept["flux_norm_visit"])
     phot["flux_norm_global"] = (
-        phot["flux_raw"] / global_median if global_median > 0 else np.nan
+        phot["flux_norm_visit"] / global_scale if global_scale > 0 else np.nan # NOTE: Possible bug here
     )
 
-    # Final photometry CSV
     phot_out = phot[
         [
             "global_index",
@@ -721,57 +573,12 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
 
     phot_out_path = output_dir / "phase1_hatp2b_45um_photometry.csv"
     phot_out.to_csv(phot_out_path, index=False)
-
-    # AOR summary CSV
-    aor_summary_df = pd.DataFrame(aor_summaries)
-    aor_summary_path = output_dir / "phase1_hatp2b_45um_aor_summary.csv"
-    aor_summary_df.to_csv(aor_summary_path, index=False)
-
-    # File summary CSV
-    file_summary_df = pd.DataFrame(file_summaries)
-    file_summary_path = output_dir / "phase1_hatp2b_45um_file_summary.csv"
-    file_summary_df.to_csv(file_summary_path, index=False)
-
-    # Manifest and duration sanity-check
-    summed_aor_duration_hr = float(aor_summary_df["duration_hr"].sum())
-    timespan_hr = float(
-        24.0
-        * (
-            phot_out["bjd_utc"].max()
-            - phot_out["bjd_utc"].min()
-        )
+    print(
+        f"Saved {phot_out_path} : {len(phot_out)} frames, "
+        f"{int(phot_out['frame_ok'].sum())} kept, "
+        f"{phot_out['aor_id'].nunique()} AORs"
     )
-    duration_warning = ""
-    lo, hi = EXPECTED_TOTAL_HOURS_RANGE
-    if not (lo <= summed_aor_duration_hr <= hi):
-        duration_warning = (
-            f"Summed AOR duration {summed_aor_duration_hr:.3f} hr "
-            f"is outside expected de Wit range [{lo}, {hi}] hr"
-        )
 
-    manifest = {
-        "base_path": str(base_path),
-        "n_files": int(len(file_summary_df)),
-        "n_frames_total": int(len(phot_out)),
-        "n_frames_kept": int(phot_out["frame_ok"].sum()),
-        "n_aors": int(phot_out["aor_id"].nunique()),
-        "bjd_start": float(phot_out["bjd_utc"].min()),
-        "bjd_end": float(phot_out["bjd_utc"].max()),
-        "timespan_hr": timespan_hr,
-        "summed_aor_duration_hr": summed_aor_duration_hr,
-        "expected_duration_range_hr": [lo, hi],
-        "duration_warning": duration_warning,
-        "output_files": {
-            "photometry_csv": str(phot_out_path),
-            "aor_summary_csv": str(aor_summary_path),
-            "file_summary_csv": str(file_summary_path),
-        },
-    }
-    manifest_path = output_dir / "phase1_hatp2b_45um_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(json.dumps(manifest, indent=2))
-
-    # Diagnostic plot
     make_phase1_diag_plot(phot_out, output_dir)
 
 
@@ -794,83 +601,23 @@ def make_phase1_diag_plot(phot: pd.DataFrame, output_dir: Path):
 
     time_hr = kept["time_hr"].to_numpy(float)
 
-    # (a) X centroid
-    axes[0].plot(
-        time_hr,
-        kept["x_cent"].to_numpy(float),
-        "k.",
-        ms=2.0,
-        alpha=0.7,
-    )
+    axes[0].plot(time_hr, kept["x_cent"].to_numpy(float), "k.", ms=2.0, alpha=0.7)
     axes[0].set_ylabel("X position\n(pixels)")
-    axes[0].text(
-        0.01,
-        0.90,
-        "(a)",
-        transform=axes[0].transAxes,
-        fontweight="bold",
-    )
+    axes[0].text(0.01, 0.90, "(a)", transform=axes[0].transAxes, fontweight="bold")
 
-    # (b) Y centroid
-    axes[1].plot(
-        time_hr,
-        kept["y_cent"].to_numpy(float),
-        "k.",
-        ms=2.0,
-        alpha=0.7,
-    )
+    axes[1].plot(time_hr, kept["y_cent"].to_numpy(float), "k.", ms=2.0, alpha=0.7)
     axes[1].set_ylabel("Y position\n(pixels)")
-    axes[1].text(
-        0.01,
-        0.90,
-        "(b)",
-        transform=axes[1].transAxes,
-        fontweight="bold",
-    )
+    axes[1].text(0.01, 0.90, "(b)", transform=axes[1].transAxes, fontweight="bold")
 
-    # (c) Noise-pixel beta
-    axes[2].plot(
-        time_hr,
-        kept["beta"].to_numpy(float),
-        "k.",
-        ms=2.0,
-        alpha=0.7,
-    )
+    axes[2].plot(time_hr, kept["beta"].to_numpy(float), "k.", ms=2.0, alpha=0.7)
     axes[2].set_ylabel(r"Noise pixels ($\beta$)")
-    axes[2].text(
-        0.01,
-        0.90,
-        "(c)",
-        transform=axes[2].transAxes,
-        fontweight="bold",
-    )
+    axes[2].text(0.01, 0.90, "(c)", transform=axes[2].transAxes, fontweight="bold")
 
-    # (d) Relative flux (global normalization)
-    axes[3].plot(
-        time_hr,
-        kept["flux_norm_global"].to_numpy(float),
-        "k.",
-        ms=2.0,
-        alpha=0.85,
-    )
-    axes[3].axhline(
-        1.0,
-        color="firebrick",
-        lw=0.9,
-        ls="--",
-        alpha=0.75,
-    )
-    axes[3].set_xlabel(
-        "Observation time from first retained point (hr)"
-    )
+    axes[3].plot(time_hr, kept["flux_norm_global"].to_numpy(float), "k.", ms=2.0, alpha=0.85)
+    axes[3].axhline(1.0, color="firebrick", lw=0.9, ls="--", alpha=0.75)
+    axes[3].set_xlabel("Observation time from first retained point (hr)")
     axes[3].set_ylabel("Relative flux")
-    axes[3].text(
-        0.01,
-        0.90,
-        "(d)",
-        transform=axes[3].transAxes,
-        fontweight="bold",
-    )
+    axes[3].text(0.01, 0.90, "(d)", transform=axes[3].transAxes, fontweight="bold")
 
     for ax in axes:
         ax.grid(alpha=0.15)
@@ -880,6 +627,7 @@ def make_phase1_diag_plot(phot: pd.DataFrame, output_dir: Path):
     plt.show()
     plt.close(fig)
     print(f"Saved diagnostic figure: {out_path}")
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -895,7 +643,7 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=Path("output"),
-        help="Directory for CSV outputs and diagnostic plot",
+        help="Directory for the photometry CSV and diagnostic plot",
     )
     p.add_argument(
         "--aor-table",
