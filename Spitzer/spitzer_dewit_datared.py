@@ -539,10 +539,13 @@ def make_phase1_outputs(base_path: Path, output_dir: Path, aor_table_path: Optio
     )
 
     kept = phot[phot["frame_ok"]]
+
     global_scale = np.nanmedian(kept["flux_norm_visit"])
-    phot["flux_norm_global"] = (
-        phot["flux_norm_visit"] / global_scale if global_scale > 0 else np.nan # NOTE: Possible bug here
-    )
+    phot["flux_norm_global"] = phot["flux_norm_visit"].copy()
+    if global_scale > 0:
+        phot.loc[phot["frame_ok"], "flux_norm_global"] = (
+            phot.loc[phot["frame_ok"], "flux_norm_visit"] / global_scale
+        )
 
     phot_out = phot[
         [
