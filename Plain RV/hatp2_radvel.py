@@ -1,6 +1,5 @@
 # NOTE: ignoring hat-p-2c, the second planet. Not fitting quadratic trend for it either.
 # NOTE: check time units when using in other scripts
-# suggestion: c++ modeling?
 
 import os
 import numpy as np
@@ -302,3 +301,129 @@ class HatP2RVModel:
             "omega_rad": omega_val,
             "omega_deg": np.rad2deg(omega_val),
         }
+    def get_model_and_residuals(self, theta=None):
+        if theta is not None:
+            self.update_params_from_theta(theta)
+
+        rv_planet = self.model(self.t_all)
+
+        gamma_hires = self.params["gamma_hires"].value
+        gamma_harpsn = self.params["gamma_harpsn"].value
+
+        rv_model = rv_planet.copy()
+        rv_model[self.mask_hires] += gamma_hires
+        rv_model[self.mask_harpsn] += gamma_harpsn
+
+        resid = self.rv_all - rv_model
+
+        return self.t_all, rv_model, resid
+
+    def plot_phase_rv(self, theta=None, filename=None):
+        import matplotlib.pyplot as plt
+
+        if theta is not None:
+            self.update_params_from_theta(theta)
+
+        t_all, rv_model, resid = self.get_model_and_residuals()
+
+        rv_planet_curve = self.model
+
+        tc_use = self.params["tc1"].value
+        per_use = self.per0
+
+        phase = phase_fold(t_all, tc_use, per_use)
+
+        phase_all = np.concatenate([phase, phase + 1.0])
+        rv_all_2 = np.concatenate([self.rv_all, self.rv_all])
+        err_all_2 = np.concatenate([self.err_all, self.err_all])
+        inst_2 = np.concatenate([self.inst_id, self.inst_id])
+        resid_2 = np.concatenate([resid, resid])
+
+        phase_model = np.linspace(0.0, 2.0, 800)
+        t_model_phase = tc_use + (phase_model - 1.0) * per_use
+        rv_planet_vals = rv_planet_curve(t_model_phase)
+
+        gamma_for_curve = self.params["gamma_hires"].value
+        rv_curve = rv_planet_vals + gamma_for_curve
+
+        mask_hires2 = (inst_2 == 0)
+        mask_harpsn2 = (inst_2 == 1)
+
+        fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+        ax[0].errorbar(
+            phase_all[mask_hires2],
+            rv_all_2[mask_hires2],
+            yerr=err_all_2[mask_hires2],
+            fmt="o",
+            ms=4,
+            alpha=0.7,
+            label="HIRES",
+        )
+
+        ax[0].errorbar(
+            phase_all[mask_harpsn2],
+            rv_all_2[mask_harpsn2],
+            yerr=err_all_2[mask_harpsn2],
+            fmt="s",
+            ms=4,
+            alpha=0.7,
+            label="HARPS-N",
+        )
+        ax[0].plot(
+            phase_model,
+            rv_curve,
+            "k-",
+            lw=1.7,
+            label="e/ω-free one-planet median model",
+        )
+        ax[0].set_ylabel("RV (m/s)")
+        ax[0].set_title("HAT-P-2b: phase-folded RV (e/ω-free one-planet)")
+        ax[0].legend()
+        ax[0].grid(alpha=0.3)
+
+        ax[1].errorbar(
+            phase_all[mask_hires2],
+            resid_2[mask_hires2],
+            yerr=err_all_2[mask_hires2],
+            fmt="o",
+            ms=4,
+            alpha=0.7,
+        )
+        ax[1].errorbar(
+            phase_all[mask_harpsn2],
+            resid_2[mask_harpsn2],
+            yerr=err_all_2[mask_harpsn2],
+            fmt="s",
+            ms=4,
+            alpha=0.7,
+        )
+        ax[1].axhline(0.0, color="r", ls="--", lw=1)
+        ax[1].set_xlabel("Orbital phase (cycles)")
+        ax[1].set_ylabel("Residuals (m/s)")
+        ax[1].grid(alpha=0.3)
+
+        plt.tight_layout()
+        if filename is not None:
+            plt.savefig(filename, dpi=200)
+            plt.close(fig)
+        else:
+            plt.show()
+
+    def plot_residual_histogram(self, theta=None, bins=30, filename=None):
+        import matplotlib.pyplot as plt
+
+        _, _, resid = self.get_model_and_residuals(theta=theta)
+
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        ax.hist(resid, bins=bins, histtype="stepfilled", alpha=0.7)
+        ax.set_xlabel("RV residual (m/s)")
+        ax.set_ylabel("Count")
+        ax.set_title("HAT-P-2b RV residual distribution")
+        ax.grid(alpha=0.3)
+
+        if filename is not None:
+            plt.savefig(filename, dpi=200)
+            plt.close(fig)
+        else:
+            plt.show()
