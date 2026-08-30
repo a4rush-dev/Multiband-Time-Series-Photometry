@@ -318,53 +318,59 @@ class HatP2RVModel:
 
         return self.t_all, rv_model, resid
 
-    def plot_phase_rv(self, theta=None, filename=None):
+    def plot_phase_rv(self, theta_rv=None, filename=None):
         import matplotlib.pyplot as plt
 
-        if theta is not None:
-            self.update_params_from_theta(theta)
+        if theta_rv is not None:
+            self.update_params_from_theta(theta_rv)
 
-        t_all, rv_model, resid = self.get_model_and_residuals()
+        t_all = self.t_all
+        rv_all = self.rv_all
+        err_all = self.err_all
+        inst_id = self.inst_id
 
-        rv_planet_curve = self.model
+        rv_planet_func = self.model
 
         tc_use = self.params["tc1"].value
         per_use = self.per0
 
         phase = phase_fold(t_all, tc_use, per_use)
 
-        phase_all = np.concatenate([phase, phase + 1.0])
-        rv_all_2 = np.concatenate([self.rv_all, self.rv_all])
-        err_all_2 = np.concatenate([self.err_all, self.err_all])
-        inst_2 = np.concatenate([self.inst_id, self.inst_id])
-        resid_2 = np.concatenate([resid, resid])
+        order = np.argsort(phase)
+        phase_sorted = phase[order]
+        rv_sorted = rv_all[order]
+        err_sorted = err_all[order]
+        inst_sorted = inst_id[order]
 
-        phase_model = np.linspace(0.0, 2.0, 800)
-        t_model_phase = tc_use + (phase_model - 1.0) * per_use
-        rv_planet_vals = rv_planet_curve(t_model_phase)
-
+        rv_planet_data = rv_planet_func(t_all)
         gamma_for_curve = self.params["gamma_hires"].value
-        rv_curve = rv_planet_vals + gamma_for_curve
+        rv_model_data = rv_planet_data + gamma_for_curve
+        resid = rv_all - rv_model_data
+        resid_sorted = resid[order]
 
-        mask_hires2 = (inst_2 == 0)
-        mask_harpsn2 = (inst_2 == 1)
+        phase_model = np.linspace(0.0, 1.0, 800)
+        t_model_phase = tc_use + phase_model * per_use
+        rv_planet_model = rv_planet_func(t_model_phase)
+        rv_curve = rv_planet_model + gamma_for_curve
+
+        mask_hires = (inst_sorted == 0)
+        mask_harpsn = (inst_sorted == 1)
 
         fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
 
         ax[0].errorbar(
-            phase_all[mask_hires2],
-            rv_all_2[mask_hires2],
-            yerr=err_all_2[mask_hires2],
+            phase_sorted[mask_hires],
+            rv_sorted[mask_hires],
+            yerr=err_sorted[mask_hires],
             fmt="o",
             ms=4,
             alpha=0.7,
             label="HIRES",
         )
-
         ax[0].errorbar(
-            phase_all[mask_harpsn2],
-            rv_all_2[mask_harpsn2],
-            yerr=err_all_2[mask_harpsn2],
+            phase_sorted[mask_harpsn],
+            rv_sorted[mask_harpsn],
+            yerr=err_sorted[mask_harpsn],
             fmt="s",
             ms=4,
             alpha=0.7,
@@ -383,17 +389,17 @@ class HatP2RVModel:
         ax[0].grid(alpha=0.3)
 
         ax[1].errorbar(
-            phase_all[mask_hires2],
-            resid_2[mask_hires2],
-            yerr=err_all_2[mask_hires2],
+            phase_sorted[mask_hires],
+            resid_sorted[mask_hires],
+            yerr=err_sorted[mask_hires],
             fmt="o",
             ms=4,
             alpha=0.7,
         )
         ax[1].errorbar(
-            phase_all[mask_harpsn2],
-            resid_2[mask_harpsn2],
-            yerr=err_all_2[mask_harpsn2],
+            phase_sorted[mask_harpsn],
+            resid_sorted[mask_harpsn],
+            yerr=err_sorted[mask_harpsn],
             fmt="s",
             ms=4,
             alpha=0.7,
@@ -409,6 +415,7 @@ class HatP2RVModel:
             plt.close(fig)
         else:
             plt.show()
+
 
     def plot_residual_histogram(self, theta=None, bins=30, filename=None):
         import matplotlib.pyplot as plt
