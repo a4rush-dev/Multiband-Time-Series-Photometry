@@ -1,0 +1,76 @@
+==================================================
+BEST FIT PARAMETERS FROM TESS
+==================================================
+t0_rel (relative) = -0.026127
+t0_absolute = 1.421004
+rp = 0.068577
+a = 9.226739
+inc = 86.793520
+period = 5.6334729 (fixed)
+ecc = 0.516 (fixed)
+w = 188.0 (fixed)
+u = [0.2, 0.3] (fixed)
+==================================================
+Initial loglikelihood = -774203.297530
+Performing maximum a posteriori fit...
+Final loglikelihood = -574.617816
+Best-fit parameters:
+parameter                     value      vary
+per1                        5.63347      False
+tc1                        -2290.39       True
+secosw1                   -0.699354       True
+sesinw1                   -0.111234       True
+k1                          943.625       True
+gamma_hires                 184.198       True
+jit_hires                   73.7205       True
+gamma_harpsn                  194.7       True
+jit_harpsn                   45.476       True
+tp1                        -2289.74           
+e1                         0.501469           
+w1                         -2.98386           
+
+
+======================================================================
+RV INTEGRATION: INITIALIZATION
+======================================================================
+RV times are treated as BJD_TDB - 2450000 in the input file.
+The modular RV model internally uses absolute BJD_TDB.
+RV reference period = 5.6334729000 days
+RV reference tc1 = 2454529.674000 BJD_TDB
+======================================================================
+
+RV INTEGRATION: running short joint test...
+ ... (more hidden) ...
+
+RV DIAGNOSTICS (joint solution)
+chi2 = 102.48
+chi2_r = 1.079
+RMS_all = 66.84 m/s
+e = 0.5015
+omega (deg) = -170.96
+
+======================================================================
+BEST FIT PARAMETERS FROM JOINT TESS + RV MODEL
+======================================================================
+
+TESS PARAMETERS
+t0_rel = 0.00001394 days
+rp = 0.07220107
+a = 8.90214378
+inc = 86.29757056 deg
+
+RV PARAMETERS
+tc1 = 2454528.30762998 BJD_TDB
+k1 = 943.27442963 m/s
+e = 0.50150689
+omega = -170.95874556 deg
+gamma_hires = 184.12367354 m/s
+gamma_harpsn = 195.47215187 m/s
+jit_hires = 73.90098213 m/s
+jit_harpsn = 45.45861954 m/s
+
+SHARED ORBITAL PARAMETERS
+period = 5.6334729000 days
+eccentricity = 0.50150689
+omega = -170.95874556 deg
+======================================================================
