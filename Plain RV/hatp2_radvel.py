@@ -286,7 +286,12 @@ class HatP2RVModel:
         chi2r = chi2 / dof
         rms = np.std(resid)
 
-        # TODO: add bic, aic. fix offset issue in final plots
+        theta_now = self.theta_from_params()
+        lnL = self.log_likelihood(theta_now)
+        k = len(theta_now)
+        N = len(self.t_all)
+        aic = 2*k - 2*lnL
+        bic = k * np.log(N) - 2 * lnL
 
         e_val, omega_val = e_omega_from_se(
             self.params["secosw1"].value,
@@ -300,7 +305,11 @@ class HatP2RVModel:
             "e": e_val,
             "omega_rad": omega_val,
             "omega_deg": np.rad2deg(omega_val),
+            "lnL": lnL,
+            "AIC": aic,
+            "BIC": bic,
         }
+
     def get_model_and_residuals(self, theta=None):
         if theta is not None:
             self.update_params_from_theta(theta)
@@ -318,11 +327,13 @@ class HatP2RVModel:
 
         return self.t_all, rv_model, resid
 
-    def plot_phase_rv(self, theta_rv=None, filename=None):
+    def plot_phase_rv(self, theta_rv=None, filename=None, samples=None, nsamples=100):
         import matplotlib.pyplot as plt
 
         if theta_rv is not None:
             self.update_params_from_theta(theta_rv)
+
+        theta_ref = self.theta_from_params()
 
         t_all = self.t_all
         rv_all = self.rv_all
@@ -350,6 +361,30 @@ class HatP2RVModel:
 
         phase_model = np.linspace(0.0, 1.0, 800)
         t_model_phase = tc_use + phase_model * per_use
+
+        if samples is None:
+            samples = getattr(self, "flat_samples", None)
+
+        fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+        if samples is not None and len(samples) > 0 and nsamples > 0:
+            ns = min(nsamples, len(samples))
+            inds = np.random.randint(len(samples), size=ns)
+            for ind in inds:
+                theta_s = samples[ind]
+                self.update_params_from_theta(theta_s)
+                rv_planet_s = rv_planet_func(t_model_phase)
+                gamma_s = self.params["gamma_hires"].value
+                rv_curve_s = rv_planet_s + gamma_s
+                ax[0].plot(
+                    phase_model,
+                    rv_curve_s,
+                    color="C1",
+                    alpha=0.05,
+                    lw=1.0,
+                )
+            self.update_params_from_theta(theta_ref)
+
         rv_planet_model = rv_planet_func(t_model_phase)
         rv_curve = rv_planet_model + gamma_for_curve
 
@@ -431,6 +466,95 @@ class HatP2RVModel:
 
         if filename is not None:
             plt.savefig(filename, dpi=200)
+            plt.close(fig)
+        else:
+            plt.show()
+
+    def posterior_summary(self, flat_samples=None, quantiles=(16, 50, 84)):
+        if flat_samples is None:
+            flat_samples = self.flat_samples
+        if flat_samples is None:
+            raise ValueError("No samples provided and self.flat_samples is None. Run run_emcee first.")
+
+        flat_samples = np.asarray(flat_samples)
+        q = np.percentile(flat_samples, quantiles, axis=0)  # shape (3, ndim)
+
+        names = [
+            "tc1", "k1", "secosw1", "sesinw1",
+            "gamma_hires", "gamma_harpsn",
+            "ln_jit_hires", "ln_jit_harpsn",
+        ]
+        summary = {}
+
+        for i, name in enumerate(names):
+            q16, q50, q84 = q[0, i], q[1, i], q[2, i]
+            summary[name] = {
+                "median": q50,
+                "minus": q50 - q16,
+                "plus": q84 - q50,
+            }
+
+        # derived e, omega from samples
+        secosw_s = flat_samples[:, 2]
+        sesinw_s = flat_samples[:, 3]
+        e_s, omega_s = e_omega_from_se(secosw_s, sesinw_s)
+        e_q = np.percentile(e_s, quantiles)
+        w_q = np.percentile(omega_s, quantiles)
+
+        summary["e"] = {
+            "median": e_q[1],
+            "minus": e_q[1] - e_q[0],
+            "plus":  e_q[2] - e_q[1],
+        }
+        summary["omega_rad"] = {
+            "median": w_q[1],
+            "minus": w_q[1] - w_q[0],
+            "plus":  w_q[2] - w_q[1],
+        }
+        summary["omega_deg"] = {
+            "median": np.rad2deg(w_q[1]),
+            "minus": np.rad2deg(w_q[1] - w_q[0]),
+            "plus":  np.rad2deg(w_q[2] - w_q[1]),
+        }
+
+        return summary
+
+    def plot_corner(self, flat_samples=None, labels=None, filename=None, truths=None):
+        import matplotlib.pyplot as plt
+        try:
+            import corner
+        except ImportError:
+            raise ImportError("corner is not installed. Install it with `pip install corner`.")
+
+        if flat_samples is None:
+            flat_samples = self.flat_samples
+        if flat_samples is None:
+            raise ValueError("No samples provided and self.flat_samples is None. Run run_emcee first.")
+
+        if labels is None:
+            labels = [
+                r"$t_{\mathrm{c}}$",
+                r"$K$",
+                r"$\sqrt{e}\cos\omega$",
+                r"$\sqrt{e}\sin\omega$",
+                r"$\gamma_{\mathrm{HIRES}}$",
+                r"$\gamma_{\mathrm{HARPSN}}$",
+                r"$\ln\,\sigma_{\mathrm{jit,HIRES}}$",
+                r"$\ln\,\sigma_{\mathrm{jit,HARPSN}}$",
+            ]
+
+        if truths is None and self.theta_med is not None:
+            truths = self.theta_med
+
+        fig = corner.corner(
+            flat_samples,
+            labels=labels,
+            truths=truths,
+            show_titles=True,
+        )
+
+        if filename is not None:
+            fig.savefig(filename, dpi=200)
             plt.close(fig)
         else:
             plt.show()
