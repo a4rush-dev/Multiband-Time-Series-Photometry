@@ -1,5 +1,3 @@
-# TODO: generate a json for mcmc best-fit parameters to feed to LS/spectral.py
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -415,6 +413,8 @@ def main() -> None:
 
     best_tess_joint, best_rv_joint = split_joint_theta(best_joint)
 
+    rv_samples = flat_joint[:,RV_SLICE]
+
     (
         best_t0_rel,
         best_rp,
@@ -448,6 +448,24 @@ def main() -> None:
     print(f"RMS_all = {rv_diag['rms']:.2f} m/s")
     print(f"e = {rv_diag['e']:.4f}")
     print(f"omega (deg) = {rv_diag['omega_deg']:.2f}")
+    print(f"lnL      = {rv_diag['lnL']:.2f}")
+    print(f"AIC      = {rv_diag['AIC']:.2f}")
+    print(f"BIC      = {rv_diag['BIC']:.2f}")
+
+    rv_summary = rv_model.posterior_summary(flat_samples=rv_samples)
+
+    print("\nRV POSTERIOR SUMMARY (median -/+)")
+    for name in [
+        "tc1", "k1", "secosw1", "sesinw1",
+        "gamma_hires", "gamma_harpsn",
+        "ln_jit_hires", "ln_jit_harpsn",
+        "e", "omega_deg",
+    ]:
+        s = rv_summary[name]
+        print(
+            f"{name:12s} = {s['median']:.6f} "
+            f"-{s['minus']:.6f} +{s['plus']:.6f}"
+    )
 
     print("\n" + "=" * 70)
     print("BEST FIT PARAMETERS FROM JOINT TESS + RV MODEL")
@@ -503,9 +521,9 @@ def main() -> None:
     ax_joint.legend()
     plt.show()
 
-    rv_model.plot_phase_rv(theta=best_rv_joint)
+    rv_model.plot_phase_rv(theta=best_rv_joint, samples=rv_samples, nsamples = 100,)
     rv_model.plot_residual_histogram(theta=best_rv_joint)
-
+    rv_model.plot_corner(flat_samples=rv_samples, truths=best_rv_joint)
 
 if __name__ == "__main__":
     main()

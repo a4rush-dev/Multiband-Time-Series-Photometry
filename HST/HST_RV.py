@@ -378,6 +378,8 @@ theta_med = np.percentile(flat, 50, axis=0)
 
 theta_rv_med, theta_hst_med = split_theta(theta_med)
 
+rv_samples = flat[:, :RV_NDIM]
+
 (
     tc1_med, k1_med, secosw_med, sesinw_med,
     gamma_hires_med, gamma_harpsn_med,
@@ -430,6 +432,25 @@ print(f"c5                = {c5_med:.6f}")
 print(f"c6                = {c6_med:.6f}")
 print(f"RV chi2           = {rv_diag['chi2']:.2f}  (reduced ~ {rv_diag['chi2r']:.3f})")
 print(f"RV RMS            = {rv_diag['rms']:.2f} m/s")
+print(f"RV lnL            = {rv_diag['lnL']:.2f}")
+print(f"RV AIC            = {rv_diag['AIC']:.2f}")
+print(f"RV BIC            = {rv_diag['BIC']:.2f}")
+
+# RV posterior summary
+rv_summary = rv_model.posterior_summary(flat_samples=rv_samples)
+
+print("\nRV POSTERIOR SUMMARY (median -/+)")
+for name in [
+    "tc1", "k1", "secosw1", "sesinw1",
+    "gamma_hires", "gamma_harpsn",
+    "ln_jit_hires", "ln_jit_harpsn",
+    "e", "omega_deg",
+]:
+    s = rv_summary[name]
+    print(
+        f"{name:12s} = {s['median']:.6f} "
+        f"-{s['minus']:.6f} +{s['plus']:.6f}"
+    )
 
 best_hst_model, sigma_hst_med, orbit_offsets_med, ln_prior_offsets_med = hst_full_model_and_offsets(theta_med)
 hst_residuals = flux_hst_norm - best_hst_model
@@ -453,8 +474,9 @@ print(f"RV-pred BJD       = {t_trans_rv_pred_med:.6f}")
 print(f"timing offset     = {dt_link_med:.6f} days")
 print(f"RMS orbit offset  = {np.std(orbit_offsets_med):.6e}")
 
-rv_model.plot_phase_rv(theta_rv=theta_rv_med)
+rv_model.plot_phase_rv(theta_rv=theta_rv_med, samples=rv_samples,nsamples=100)
 rv_model.plot_residual_histogram(theta_rv=theta_rv_med)
+rv_model.plot_corner(flat_samples=rv_samples, truths = theta_rv_med)
 
 # HST data + model
 fig_hst, (ax1, ax2) = plt.subplots(
