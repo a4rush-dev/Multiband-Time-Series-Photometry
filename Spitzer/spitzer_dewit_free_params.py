@@ -1,146 +1,178 @@
 from __future__ import annotations
 
 import argparse
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Tuple
 
+import batman
+import emcee
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from scipy.optimize import minimize
 from scipy.spatial import cKDTree
-import emcee
-import batman 
 
-P_ORB = 5.6334675         
-T0_TRANSIT = 2455288.84969 
-ECC = 0.51023         
-OMEGA_DEG = 188.44   
+
+LOG = logging.getLogger(__name__)
+
+# Orbital ephemeris (de Wit et al. 2017).
+P_ORB = 5.6334675
+T0_TRANSIT = 2455288.84969
+ECC = 0.51023
+OMEGA_DEG = 188.44
+INC_DEG = 86.16
+
+# Stellar density (de Wit et al. 2017) used to derive a/Rs so the
+# secondary-eclipse geometry is physically consistent with the primary
+# transit geometry, rather than an arbitrary guess.
+STELLAR_DENSITY_CGS = 0.434
+G_CGS = 6.67430e-8
+
+
+def derive_a_over_rs(stellar_density_cgs: float, period_days: float) -> float:
+    """a/Rs from Kepler's third law and the mean stellar density."""
+    period_seconds = period_days * 86400.0
+    a_rs_cubed = stellar_density_cgs * G_CGS * period_seconds ** 2 / (3.0 * np.pi)
+    return float(a_rs_cubed ** (1.0 / 3.0))
+
+
+A_RS = derive_a_over_rs(STELLAR_DENSITY_CGS, P_ORB)
+
+TRANSIT_DEPTH_PPM = 4941.0
+
+LD_LAW = "quadratic"
+LD_COEFFS = [0.06, 0.23]
+
+EXPOSURE_SECONDS = 0.4
+EXPOSURE_DAYS = EXPOSURE_SECONDS / 86400.0
+BATMAN_SUPERSAMPLE = 7
 
 DEFAULT_BIN_WIDTH = 0.00025
 
-PHASE_MIN_PPM = 322.0
-PHASE_PEAK_PPM = 1178.0
-PHASE_PEAK_OFFSET_HR = 5.40
-PHASE_RISE_HR = 5.5
-PHASE_DECAY_HR = 10.3
+N_IP_NEIGHBORS = 50
+MIN_IP_POINTS = 200
+MIN_KERNEL_SIGMA_XY = 0.002
+MIN_KERNEL_SIGMA_BETA = 0.02
+IP_QUERY_CHUNK_SIZE = 25000
+MIN_NEIGHBOR_TIME_SEPARATION_MIN = 2.0
 
-BASE_PHOT_NOISE_PPM = 75.0   # typical noise per 1 hr bin
+BIN_ERROR_FLOOR_PPM = 25.0
 
-RP_RS = 0.0704        
-A_RS = 8.28     
-INC_DEG = 85.0            
-LIMB_DARKENING_COEFFS = [0.12, 0.34, 0.20, 0.10]  
+PHASE_WRAP_OFFSET = 0.05
+
+ECLIPSE_EVENT_HALF_WIDTH = 0.010
+ECLIPSE_BASELINE_HALF_WIDTH = 0.028
+
+DEFAULT_N_WALKERS = 64
+DEFAULT_N_STEPS = 8000
+DEFAULT_N_BURN = 3000
+RANDOM_SEED = 24601
+
+PARAM_NAMES = ["f_min_ppm", "c1_ppm", "t_peak_hr", "tau_rise_hr", "tau_decay_hr", "jitter_ppm"]
+
+PRIOR_BOUNDS = {
+    "f_min_ppm": (-1000.0, 3000.0),
+    "c1_ppm": (0.0, 4000.0),
+    "t_peak_hr": (-20.0, 40.0),
+    "tau_rise_hr": (0.05, 50.0),
+    "tau_decay_hr": (0.05, 50.0),
+    "jitter_ppm": (0.0, 4000.0),
+}
 
 
-def mad_std(x: np.ndarray) -> float:
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
+ECLIPSE_DEPTH_PPM_FIXED = 900.0
+
+def mad_std(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
         return np.nan
-    med = np.nanmedian(x)
-    mad = np.nanmedian(np.abs(x - med))
-    if not np.isfinite(mad):
-        return np.nan
-    return 1.4826 * mad
-
-def phase_fold(bjd: np.ndarray,
-               period: float = P_ORB,
-               t0: float = T0_TRANSIT) -> np.ndarray:
-    ph = ((np.asarray(bjd, dtype=float) - t0) / period) % 1.0
-    ph = np.where(ph > 0.5, ph - 1.0, ph)
-    return ph
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    return float(1.4826 * mad)
 
 
-def bin_phase(phase: np.ndarray,
-              flux: np.ndarray,
-              bin_width: float = DEFAULT_BIN_WIDTH) -> pd.DataFrame:
-    phase = np.asarray(phase, dtype=float)
-    flux = np.asarray(flux, dtype=float)
+def robust_location(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.median(values)) if values.size else np.nan
 
-    edges = np.arange(-0.5, 0.5 + bin_width, bin_width)
-    idx = np.digitize(phase, edges) - 1
 
-    rows = []
-    for k in range(len(edges) - 1):
-        m = idx == k
-        if not np.any(m):
-            continue
-        ff = flux[m]
-        pp = phase[m]
-        good = np.isfinite(ff) & np.isfinite(pp)
-        if good.sum() == 0:
-            continue
-        ff = ff[good]
-        pp = pp[good]
-        n = ff.size
-        med = np.nanmedian(ff)
-        ebin = mad_std(ff) / np.sqrt(max(n, 1))
-        rows.append(
-            {
-                "phase_center": 0.5 * (edges[k] + edges[k + 1]),
-                "phase_median": float(np.nanmedian(pp)),
-                "flux_median": float(med),
-                "flux_err": float(ebin),
-                "n_points": int(n),
-            }
-        )
-    return pd.DataFrame(rows)
+def as_bool_mask(series):
+    if series.dtype == bool:
+        return series.to_numpy(dtype=bool)
+    text = series.astype(str).str.strip().str.lower()
+    return text.isin(["true", "t", "1", "yes", "y"]).to_numpy(dtype=bool)
 
-def time_of_periastron(t0_bjd: float,
-                       period_days: float,
-                       e: float,
-                       omega_deg: float) -> float:
+
+def phase_fold_01(bjd, period_days=P_ORB, t0_bjd=T0_TRANSIT, wrap_offset=PHASE_WRAP_OFFSET):
+    bjd = np.asarray(bjd, dtype=float)
+    raw = ((bjd - t0_bjd) / period_days) % 1.0
+    return (raw + wrap_offset) % 1.0
+
+
+def centered_phase(phase_01, center_01):
+    phase_01 = np.asarray(phase_01, dtype=float)
+    return ((phase_01 - center_01 + 0.5) % 1.0) - 0.5
+
+
+def circular_phase_distance(phase, center):
+    return np.abs(centered_phase(np.asarray(phase, float), center))
+
+
+def true_to_eccentric_anomaly(true_anomaly, eccentricity):
+    tan_half_e = np.sqrt((1.0 - eccentricity) / (1.0 + eccentricity)) * np.tan(0.5 * true_anomaly)
+    eccentric_anomaly = 2.0 * np.arctan(tan_half_e)
+    return float(eccentric_anomaly % (2.0 * np.pi))
+
+
+def true_to_mean_anomaly(true_anomaly, eccentricity):
+    eccentric_anomaly = true_to_eccentric_anomaly(true_anomaly, eccentricity)
+    return float((eccentric_anomaly - eccentricity * np.sin(eccentric_anomaly)) % (2.0 * np.pi))
+
+
+def transit_to_periastron_time(t_transit_bjd, period_days, eccentricity, omega_deg):
     omega = np.deg2rad(omega_deg)
-    f_tr = (0.5 * np.pi) - omega
-
-    tan_half_E = np.sqrt((1.0 - e) / (1.0 + e)) * np.tan(0.5 * f_tr)
-    E_tr = 2.0 * np.arctan(tan_half_E)
-    M_tr = E_tr - e * np.sin(E_tr)
-
-    delta_t_days = (period_days / (2.0 * np.pi)) * M_tr
-    t_peri = t0_bjd - delta_t_days
-    return float(t_peri)
+    f_transit = 0.5 * np.pi - omega
+    m_transit = true_to_mean_anomaly(f_transit, eccentricity)
+    return float(t_transit_bjd - period_days * m_transit / (2.0 * np.pi))
 
 
-def asymmetric_lorentzian_flux_param(t_bjd: np.ndarray,
-                                     t_peri_bjd: float,
-                                     F_min_ppm: float,
-                                     F_peak_ppm: float,
-                                     t_peak_hr: float,
-                                     tau_rise_hr: float,
-                                     tau_decay_hr: float) -> np.ndarray:
-    t_bjd = np.asarray(t_bjd, dtype=float)
-    delta_t_hr = (t_bjd - t_peri_bjd) * 24.0
-
-    F_min = F_min_ppm
-    A = F_peak_ppm - F_min_ppm
-    t_peak = t_peak_hr
-    tau_rise = tau_rise_hr
-    tau_decay = tau_decay_hr
-
-    u = np.empty_like(delta_t_hr)
-    before = delta_t_hr <= t_peak
-    after = ~before
-    u[before] = (delta_t_hr[before] - t_peak) / tau_rise
-    u[after] = (delta_t_hr[after] - t_peak) / tau_decay
-
-    return F_min + A / (1.0 + u**2)
+def transit_to_occultation_time(t_transit_bjd, period_days, eccentricity, omega_deg):
+    omega = np.deg2rad(omega_deg)
+    f_transit = 0.5 * np.pi - omega
+    f_occultation = 1.5 * np.pi - omega
+    m_transit = true_to_mean_anomaly(f_transit, eccentricity)
+    m_occultation = true_to_mean_anomaly(f_occultation, eccentricity)
+    delta_m = (m_occultation - m_transit) % (2.0 * np.pi)
+    return float(t_transit_bjd + period_days * delta_m / (2.0 * np.pi))
 
 
-def fixed_phase_model_flux(t_bjd: np.ndarray) -> np.ndarray:
-    t_bjd = np.asarray(t_bjd, dtype=float)
-    t_peri = time_of_periastron(T0_TRANSIT, P_ORB, ECC, OMEGA_DEG)
-    phase_ppm = asymmetric_lorentzian_flux_param(
-        t_bjd=t_bjd,
-        t_peri_bjd=t_peri,
-        F_min_ppm=PHASE_MIN_PPM,
-        F_peak_ppm=PHASE_PEAK_PPM,
-        t_peak_hr=PHASE_PEAK_OFFSET_HR,
-        tau_rise_hr=PHASE_RISE_HR,
-        tau_decay_hr=PHASE_DECAY_HR,
-    )
-    return 1.0 + phase_ppm / 1e6
+T_PERI_REF = transit_to_periastron_time(T0_TRANSIT, P_ORB, ECC, OMEGA_DEG)
+T_OCC_REF = transit_to_occultation_time(T0_TRANSIT, P_ORB, ECC, OMEGA_DEG)
 
-def make_transit_params() -> batman.TransitParams:
+PHASE_TRANSIT = phase_fold_01(np.array([T0_TRANSIT]))[0]
+PHASE_OCCULTATION = phase_fold_01(np.array([T_OCC_REF]))[0]
+PHASE_PERIASTRON = phase_fold_01(np.array([T_PERI_REF]))[0]
+
+RP_RS = float(np.sqrt(TRANSIT_DEPTH_PPM * 1.0e-6))
+
+
+def nearest_periodic_epoch(reference_event_bjd, query_times_bjd, period_days=P_ORB):
+    query_times_bjd = np.asarray(query_times_bjd, dtype=float)
+    epoch_number = np.rint((query_times_bjd - reference_event_bjd) / period_days)
+    return reference_event_bjd + epoch_number * period_days
+
+
+def hours_since_periastron(time_bjd):
+    time_bjd = np.asarray(time_bjd, dtype=float)
+    t_peri = nearest_periodic_epoch(T_PERI_REF, time_bjd, P_ORB)
+    return (time_bjd - t_peri) * 24.0
+
+
+def make_geometry_params():
     params = batman.TransitParams()
     params.t0 = T0_TRANSIT
     params.per = P_ORB
@@ -149,497 +181,724 @@ def make_transit_params() -> batman.TransitParams:
     params.inc = INC_DEG
     params.ecc = ECC
     params.w = OMEGA_DEG
-    params.limb_dark = "nonlinear"
-    params.u = LIMB_DARKENING_COEFFS
+    params.t_secondary = T_OCC_REF
+    params.limb_dark = LD_LAW
+    params.u = LD_COEFFS
+    params.fp = 0.0
     return params
 
 
-def batman_transit_flux(time_bjd: np.ndarray) -> np.ndarray:
-    params = make_transit_params()
-    exposure_days = 0.4 / 86400.0
+def compute_transit_shape(time_bjd):
+    time_bjd = np.asarray(time_bjd, dtype=float)
+    params = make_geometry_params()
     model = batman.TransitModel(
-        params,
-        time_bjd,
-        supersample_factor=10,
-        exp_time=exposure_days,
+        params, time_bjd, transittype="primary",
+        supersample_factor=BATMAN_SUPERSAMPLE, exp_time=EXPOSURE_DAYS,
     )
     return model.light_curve(params)
 
 
-def eclipse_visibility(time_bjd: np.ndarray) -> np.ndarray:
-    params = make_transit_params()
-
-    omega = np.deg2rad(OMEGA_DEG)
-    f_occ = 1.5 * np.pi - omega
-    tan_half_E_occ = np.sqrt((1.0 - ECC) / (1.0 + ECC)) * np.tan(0.5 * f_occ)
-    E_occ = 2.0 * np.arctan(tan_half_E_occ)
-    M_occ = E_occ - ECC * np.sin(E_occ)
-    delta_t_occ_days = (P_ORB / (2.0 * np.pi)) * M_occ
-    t_secondary = T0_TRANSIT + delta_t_occ_days
-    params.t_secondary = t_secondary
-
+def compute_eclipse_window(time_bjd):
+    time_bjd = np.asarray(time_bjd, dtype=float)
+    params = make_geometry_params()
     params.fp = 1.0
     params.limb_dark = "uniform"
     params.u = []
-
-    exposure_days = 0.4 / 86400.0
     model = batman.TransitModel(
-        params,
-        time_bjd,
-        transittype="secondary",
-        supersample_factor=10,
-        exp_time=exposure_days,
+        params, time_bjd, transittype="secondary",
+        supersample_factor=BATMAN_SUPERSAMPLE, exp_time=EXPOSURE_DAYS,
     )
-    visibility = model.light_curve(params) - 1.0
-    return np.clip(visibility, 0.0, 1.0)
+    unit_secondary_flux = model.light_curve(params)
+    visibility = unit_secondary_flux - 1.0  # 1 outside eclipse, 0 at full eclipse
+    return 1.0 - visibility  # 0 outside eclipse, 1 at full eclipse
 
-def system_model_flux(t_bjd: np.ndarray,
-                      theta_phase: np.ndarray) -> np.ndarray:
-    t_bjd = np.asarray(t_bjd, dtype=float)
 
-    # Stellar transit
-    transit_flux = batman_transit_flux(t_bjd)
-
-    # Planet heating
-    F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr = theta_phase
-    t_peri = time_of_periastron(T0_TRANSIT, P_ORB, ECC, OMEGA_DEG)
-    planet_ppm = asymmetric_lorentzian_flux_param(
-        t_bjd=t_bjd,
-        t_peri_bjd=t_peri,
-        F_min_ppm=F_min_ppm,
-        F_peak_ppm=F_peak_ppm,
-        t_peak_hr=t_peak_hr,
-        tau_rise_hr=tau_rise_hr,
-        tau_decay_hr=tau_decay_hr,
+def asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr):
+    t = np.asarray(hours_since_peri, dtype=float)
+    tau_rise_hr = max(float(tau_rise_hr), 0.05)
+    tau_decay_hr = max(float(tau_decay_hr), 0.05)
+    u = np.where(
+        t < t_peak_hr,
+        (t - t_peak_hr) / tau_rise_hr,
+        (t - t_peak_hr) / tau_decay_hr,
     )
-
-    # Eclipse visibility
-    vis = eclipse_visibility(t_bjd)
-
-    return transit_flux * (1.0 + planet_ppm * vis / 1e6)
-
-N_IP_NEIGHBORS = 50
-MIN_KERNEL_WIDTH_PIX = 0.002
-IP_QUERY_CHUNK_SIZE = 25_000
-
-def weighted_mean(values: np.ndarray,
-                  weights: np.ndarray) -> float:
-    total_weight = np.sum(weights)
-    if (not np.isfinite(total_weight)) or total_weight <= 0.0:
-        return np.nan
-    return np.sum(values * weights) / total_weight
+    return f_min_ppm + c1_ppm / (u * u + 1.0)
 
 
-def build_ip_sensitivity_map(x_cent: np.ndarray,
-                             y_cent: np.ndarray,
-                             detector_ratio: np.ndarray) -> np.ndarray:
+def astrophysical_flux_from_shapes(transit_shape, eclipse_window, hours_since_peri, theta_astro):
+    f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr = theta_astro
+    fp_ppm = asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr)
+    return transit_shape + fp_ppm * 1.0e-6 - (ECLIPSE_DEPTH_PPM_FIXED * 1.0e-6) * eclipse_window
+
+
+def astrophysical_flux(time_bjd, theta_astro):
+    time_bjd = np.asarray(time_bjd, dtype=float)
+    transit_shape = compute_transit_shape(time_bjd)
+    eclipse_window = compute_eclipse_window(time_bjd)
+    hours_since_peri = hours_since_periastron(time_bjd)
+    return astrophysical_flux_from_shapes(transit_shape, eclipse_window, hours_since_peri, theta_astro)
+
+
+def standardized_coordinates(x_cent, y_cent, beta):
     x_cent = np.asarray(x_cent, dtype=float)
     y_cent = np.asarray(y_cent, dtype=float)
-    detector_ratio = np.asarray(detector_ratio, dtype=float)
+    beta = np.asarray(beta, dtype=float)
+    x_scale = max(mad_std(x_cent), MIN_KERNEL_SIGMA_XY)
+    y_scale = max(mad_std(y_cent), MIN_KERNEL_SIGMA_XY)
+    beta_scale = max(mad_std(beta), MIN_KERNEL_SIGMA_BETA)
+    return np.column_stack([
+        (x_cent - np.median(x_cent)) / x_scale,
+        (y_cent - np.median(y_cent)) / y_scale,
+        (beta - np.median(beta)) / beta_scale,
+    ])
 
-    n_points = len(x_cent)
-    if n_points <= N_IP_NEIGHBORS:
-        raise RuntimeError("Not enough rows for the requested IP map.")
 
-    coords = np.column_stack([x_cent, y_cent])
-    tree = cKDTree(coords)
-    query_k = N_IP_NEIGHBORS + 1
+def leave_one_out_pixel_map(time_bjd, x_cent, y_cent, beta, flux, n_neighbors=N_IP_NEIGHBORS):
+    time_bjd = np.asarray(time_bjd, dtype=float)
+    x_cent = np.asarray(x_cent, dtype=float)
+    y_cent = np.asarray(y_cent, dtype=float)
+    beta = np.asarray(beta, dtype=float)
+    flux = np.asarray(flux, dtype=float)
 
-    sensitivity = np.ones(n_points, dtype=float)
+    n = flux.size
+    if n < MIN_IP_POINTS:
+        LOG.warning("Only %d usable points in this AOR; returning unity pixel map.", n)
+        return np.ones(n, dtype=float)
 
-    print("\nBuilding intrapixel sensitivity map (cKDTree leave-one-out)...")
+    coordinates = standardized_coordinates(x_cent, y_cent, beta)
+    tree = cKDTree(coordinates)
 
-    for start in range(0, n_points, IP_QUERY_CHUNK_SIZE):
-        stop = min(start + IP_QUERY_CHUNK_SIZE, n_points)
-        _, neighbour_indices = tree.query(
-            coords[start:stop],
-            k=query_k,
-            workers=-1,
-        )
-        if neighbour_indices.ndim == 1:
-            neighbour_indices = neighbour_indices[:, None]
+    query_k = min(n, max(4 * n_neighbors + 1, n_neighbors + 10))
+    _, candidates_all = tree.query(coordinates, k=query_k, workers=-1)
+    if candidates_all.ndim == 1:
+        candidates_all = candidates_all[:, None]
 
-        for local_index, global_index in enumerate(range(start, stop)):
-            neighbours = neighbour_indices[local_index]
-            neighbours = neighbours[neighbours != global_index]
-            neighbours = neighbours[:N_IP_NEIGHBORS]
+    minimum_time_days = MIN_NEIGHBOR_TIME_SEPARATION_MIN / (24.0 * 60.0)
+    sensitivity = np.ones(n, dtype=float)
 
-            if len(neighbours) < 5:
-                sensitivity[global_index] = 1.0
+    for start in range(0, n, IP_QUERY_CHUNK_SIZE):
+        stop = min(start + IP_QUERY_CHUNK_SIZE, n)
+        for i in range(start, stop):
+            candidate_indices = candidates_all[i]
+            candidate_indices = candidate_indices[candidate_indices != i]
+
+            time_separated = np.abs(time_bjd[candidate_indices] - time_bjd[i]) >= minimum_time_days
+            candidate_indices = candidate_indices[time_separated]
+
+            candidate_indices = candidate_indices[
+                np.isfinite(flux[candidate_indices]) & (flux[candidate_indices] > 0.0)
+            ]
+
+            neighbors = candidate_indices[:n_neighbors]
+            if neighbors.size < max(10, n_neighbors // 4):
+                sensitivity[i] = 1.0
                 continue
 
-            dx = x_cent[neighbours] - x_cent[global_index]
-            dy = y_cent[neighbours] - y_cent[global_index]
+            delta = coordinates[neighbors] - coordinates[i]
+            sigma = np.std(delta, axis=0, ddof=1)
+            sigma[0] = max(sigma[0], 0.20)
+            sigma[1] = max(sigma[1], 0.20)
+            sigma[2] = max(sigma[2], 0.20)
 
-            sigma_x = max(np.std(dx, ddof=1), MIN_KERNEL_WIDTH_PIX)
-            sigma_y = max(np.std(dy, ddof=1), MIN_KERNEL_WIDTH_PIX)
+            exponent = -0.5 * np.sum((delta / sigma) ** 2, axis=1)
+            weights = np.exp(np.clip(exponent, -700.0, 0.0))
 
-            weights = np.exp(
-                -0.5 * ((dx / sigma_x)**2 + (dy / sigma_y)**2)
-            )
+            weight_sum = np.sum(weights)
+            if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+                sensitivity[i] = 1.0
+                continue
 
-            estimate = weighted_mean(detector_ratio[neighbours], weights)
-            if np.isfinite(estimate) and estimate > 0.0:
-                sensitivity[global_index] = estimate
-            else:
-                sensitivity[global_index] = 1.0
+            estimate = np.sum(weights * flux[neighbors]) / weight_sum
+            sensitivity[i] = estimate if np.isfinite(estimate) and estimate > 0.0 else 1.0
 
-        print(f" IP map progress: {stop:,}/{n_points:,} "
-              f"({100.0 * stop / n_points:5.1f}%)")
+        LOG.info("Pixel-map progress: %d / %d", stop, n)
 
     valid = np.isfinite(sensitivity) & (sensitivity > 0.0)
-    sensitivity /= np.median(sensitivity[valid])
+    if not np.any(valid):
+        return np.ones(n, dtype=float)
 
+    sensitivity /= np.median(sensitivity[valid])
     return sensitivity
 
 
-def apply_ip_correction(flux_global: np.ndarray,
-                        fixed_model: np.ndarray,
-                        x_cent: np.ndarray,
-                        y_cent: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    flux_global = np.asarray(flux_global, dtype=float)
-    fixed_model = np.asarray(fixed_model, dtype=float)
-    x_cent = np.asarray(x_cent, dtype=float)
-    y_cent = np.asarray(y_cent, dtype=float)
+def apply_pixel_map_per_aor(df):
+    df = df.copy()
+    df["ip_sensitivity"] = 1.0
+    df["flux_corr_ipix"] = df["flux_norm_global"].to_numpy(dtype=float)
 
-    detector_ratio = flux_global / fixed_model
-    detector_ratio /= np.median(detector_ratio)
+    if "aor_id" not in df.columns:
+        df["aor_id"] = "all"
 
-    sensitivity = build_ip_sensitivity_map(
-        x_cent=x_cent,
-        y_cent=y_cent,
-        detector_ratio=detector_ratio,
-    )
+    for aor_id, group in df.groupby("aor_id", sort=False):
+        indices = group.index.to_numpy()
+        flux = group["flux_norm_global"].to_numpy(dtype=float)
+        time_bjd = group["bjd_utc"].to_numpy(dtype=float)
+        x_cent = group["x_cent"].to_numpy(dtype=float)
+        y_cent = group["y_cent"].to_numpy(dtype=float)
+        beta = group["beta"].to_numpy(dtype=float)
 
-    corrected_flux = flux_global / sensitivity
-    global_norm = np.median(corrected_flux / fixed_model)
-    corrected_flux /= global_norm
+        finite = (
+            np.isfinite(time_bjd) & np.isfinite(x_cent) & np.isfinite(y_cent)
+            & np.isfinite(beta) & np.isfinite(flux) & (flux > 0.0)
+        )
 
-    return corrected_flux, sensitivity
+        sensitivity = np.ones(indices.size, dtype=float)
 
-def log_likelihood_theta(theta: np.ndarray,
-                         phase: np.ndarray,
-                         flux: np.ndarray,
-                         flux_err: np.ndarray) -> float:
-    F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, log_sigma_ppm = theta
+        if finite.sum() >= MIN_IP_POINTS:
+            LOG.info("Building pixel map for AOR %s (%d valid frames).", aor_id, int(finite.sum()))
+            sensitivity[finite] = leave_one_out_pixel_map(
+                time_bjd=time_bjd[finite], x_cent=x_cent[finite],
+                y_cent=y_cent[finite], beta=beta[finite], flux=flux[finite],
+            )
+        else:
+            LOG.warning("Skipping pixel map for AOR %s: %d valid frames.", aor_id, int(finite.sum()))
 
-    t_bjd = T0_TRANSIT + phase * P_ORB
-    model_flux = system_model_flux(
-        t_bjd,
-        np.array([F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr]),
-    )
+        df.loc[indices, "ip_sensitivity"] = sensitivity
+        df.loc[indices, "flux_corr_ipix"] = flux / sensitivity
 
-    sigma_ppm = np.exp(log_sigma_ppm)
-    total_err = np.sqrt(flux_err**2 + (sigma_ppm / 1e6)**2)
-
-    resid = flux - model_flux
-    chi2 = np.sum((resid / total_err)**2)
-    norm = np.sum(np.log(2.0 * np.pi * total_err**2))
-    return -0.5 * (chi2 + norm)
+    return df
 
 
-def log_prior_theta(theta: np.ndarray) -> float:
-    F_min_ppm, F_peak_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, log_sigma_ppm = theta
+def out_of_event_baseline_mask(phase_01):
+    phase_01 = np.asarray(phase_01, dtype=float)
+    near_transit = circular_phase_distance(phase_01, PHASE_TRANSIT) < 0.035
+    near_occultation = circular_phase_distance(phase_01, PHASE_OCCULTATION) < 0.035
+    near_periastron = circular_phase_distance(phase_01, PHASE_PERIASTRON) < 0.065
+    return ~(near_transit | near_occultation | near_periastron)
 
-    if not (0.0 < F_min_ppm < 2000.0):
-        return -np.inf
-    if not (0.0 < F_peak_ppm < 3000.0):
-        return -np.inf
-    if not (0.0 < t_peak_hr < 20.0):
-        return -np.inf
-    if not (0.5 < tau_rise_hr < 20.0):
-        return -np.inf
-    if not (0.5 < tau_decay_hr < 40.0):
-        return -np.inf
-    if not (np.log(10.0) < log_sigma_ppm < np.log(1000.0)):
-        return -np.inf
+
+def normalize_per_aor_baseline(df):
+    df = df.copy()
+    df["aor_baseline"] = np.nan
+    df["flux_corr_final"] = np.nan
+
+    for aor_id, group in df.groupby("aor_id", sort=False):
+        indices = group.index.to_numpy()
+        phase = group["phase"].to_numpy(dtype=float)
+        flux = group["flux_corr_ipix"].to_numpy(dtype=float)
+
+        finite = np.isfinite(phase) & np.isfinite(flux) & (flux > 0.0)
+        baseline_mask = finite & out_of_event_baseline_mask(phase)
+        if baseline_mask.sum() < 20:
+            baseline_mask = finite
+
+        baseline = robust_location(flux[baseline_mask])
+        if not np.isfinite(baseline) or baseline <= 0.0:
+            baseline = 1.0
+
+        df.loc[indices, "aor_baseline"] = baseline
+        df.loc[indices, "flux_corr_final"] = flux / baseline
+
+    global_scale = robust_location(df["flux_corr_final"].to_numpy(float))
+    if np.isfinite(global_scale) and global_scale > 0.0:
+        df["flux_corr_final"] /= global_scale
+
+    return df
+
+
+def bin_phase_curve(phase_01, flux, bin_width=DEFAULT_BIN_WIDTH):
+    phase_01 = np.asarray(phase_01, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+
+    valid = np.isfinite(phase_01) & np.isfinite(flux) & (phase_01 >= 0.0) & (phase_01 < 1.0)
+    phase_01 = phase_01[valid]
+    flux = flux[valid]
+
+    n_bins = int(np.round(1.0 / bin_width))
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_index = np.digitize(phase_01, edges, right=False) - 1
+    bin_index = np.clip(bin_index, 0, n_bins - 1)
+
+    rows = []
+    for bin_id in range(n_bins):
+        use = bin_index == bin_id
+        if not np.any(use):
+            continue
+
+        phase_here = phase_01[use]
+        flux_here = flux[use]
+        n_points = flux_here.size
+
+        scatter = mad_std(flux_here)
+        if not np.isfinite(scatter) or scatter <= 0.0:
+            scatter = np.std(flux_here, ddof=1) if n_points > 1 else np.nan
+
+        error_ppm = scatter * 1.0e6 / np.sqrt(n_points) if np.isfinite(scatter) and n_points > 1 else BIN_ERROR_FLOOR_PPM
+        error_ppm = max(error_ppm, BIN_ERROR_FLOOR_PPM)
+
+        rows.append({
+            "bin_id": bin_id,
+            "phase_left": edges[bin_id],
+            "phase_right": edges[bin_id + 1],
+            "phase_center": 0.5 * (edges[bin_id] + edges[bin_id + 1]),
+            "phase_median": float(np.median(phase_here)),
+            "flux_median": float(np.median(flux_here)),
+            "flux_mean": float(np.mean(flux_here)),
+            "flux_err": error_ppm / 1.0e6,
+            "flux_err_ppm": error_ppm,
+            "n_points": int(n_points),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def measure_eclipse_depth_ppm(binned):
+    phase = binned["phase_center"].to_numpy(dtype=float)
+    flux = binned["flux_median"].to_numpy(dtype=float)
+
+    dist = circular_phase_distance(phase, PHASE_OCCULTATION)
+    event_mask = dist <= ECLIPSE_EVENT_HALF_WIDTH
+    baseline_mask = (dist > ECLIPSE_EVENT_HALF_WIDTH) & (dist <= ECLIPSE_BASELINE_HALF_WIDTH)
+
+    if event_mask.sum() < 5 or baseline_mask.sum() < 10:
+        return np.nan
+
+    baseline_level = robust_location(flux[baseline_mask])
+    event_level = robust_location(flux[event_mask])
+
+    if not np.isfinite(baseline_level) or not np.isfinite(event_level):
+        return np.nan
+
+    return float((baseline_level - event_level) * 1.0e6)
+
+
+@dataclass(frozen=True)
+class FitSummary:
+    f_min_ppm: float
+    c1_ppm: float
+    t_peak_hr: float
+    tau_rise_hr: float
+    tau_decay_hr: float
+    jitter_ppm: float
+
+
+def log_prior(theta):
+    for value, name in zip(theta, PARAM_NAMES):
+        lo, hi = PRIOR_BOUNDS[name]
+        if not (lo <= value <= hi):
+            return -np.inf
     return 0.0
 
 
-def log_posterior_theta(theta: np.ndarray,
-                        phase: np.ndarray,
-                        flux: np.ndarray,
-                        flux_err: np.ndarray) -> float:
-    lp = log_prior_theta(theta)
+def log_likelihood(theta, transit_shape_binned, eclipse_window_binned, hours_since_peri_binned, flux_binned, err_binned):
+    f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, jitter_ppm = theta
+
+    fp_ppm = asymmetric_lorentzian_ppm(hours_since_peri_binned, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr)
+    model = (
+        transit_shape_binned
+        + fp_ppm * 1.0e-6
+        - (ECLIPSE_DEPTH_PPM_FIXED * 1.0e-6) * eclipse_window_binned
+    )
+
+    sigma2 = err_binned * err_binned + (jitter_ppm * 1.0e-6) ** 2
+    resid2 = (flux_binned - model) ** 2
+
+    return float(-0.5 * np.sum(resid2 / sigma2 + np.log(2.0 * np.pi * sigma2)))
+
+
+def log_probability(theta, *args):
+    lp = log_prior(theta)
     if not np.isfinite(lp):
         return -np.inf
-    ll = log_likelihood_theta(theta, phase, flux, flux_err)
+    ll = log_likelihood(theta, *args)
+    if not np.isfinite(ll):
+        return -np.inf
     return lp + ll
 
 
-def run_emcee_lorentzian(phase: np.ndarray,
-                         flux: np.ndarray,
-                         flux_err: np.ndarray,
-                         n_walkers: int = 48,
-                         n_steps: int = 3000,
-                         burnin: int = 1500) -> tuple[np.ndarray, np.ndarray]:
-    init_F_min = PHASE_MIN_PPM
-    init_F_peak = PHASE_PEAK_PPM
-    init_t_peak = PHASE_PEAK_OFFSET_HR
-    init_tau_rise = PHASE_RISE_HR
-    init_tau_decay = PHASE_DECAY_HR
-    init_log_sigma = np.log(BASE_PHOT_NOISE_PPM)
+def preoptimize_start(theta_init, args):
+    def neg_log_prob_safe(theta):
+        lp = log_probability(theta, *args)
+        if not np.isfinite(lp):
+            return 1.0e10
+        return -lp
 
-    p0 = np.vstack([
-        np.random.normal(init_F_min,   50.0,  size=n_walkers),
-        np.random.normal(init_F_peak,  50.0,  size=n_walkers),
-        np.random.normal(init_t_peak,   1.0,  size=n_walkers),
-        np.random.normal(init_tau_rise, 1.0,  size=n_walkers),
-        np.random.normal(init_tau_decay,1.0,  size=n_walkers),
-        np.random.normal(init_log_sigma,0.1,  size=n_walkers),
-    ]).T
-
-    sampler = emcee.EnsembleSampler(
-        n_walkers,
-        6,
-        log_posterior_theta,
-        args=(phase, flux, flux_err),
+    result = minimize(
+        neg_log_prob_safe, theta_init, method="Nelder-Mead",
+        options={"maxiter": 8000, "xatol": 1.0e-7, "fatol": 1.0e-7},
     )
+    theta_start = result.x if result.success else theta_init
 
-    print("\nRunning EMCEE Lorentzian-parameter sampling on binned data...")
+    LOG.info("Pre-optimization success=%s", result.success)
+    for name, value in zip(PARAM_NAMES, theta_start):
+        LOG.info("  start %-14s = %9.3f", name, value)
+
+    return theta_start
+
+
+def initialize_walkers(n_walkers, theta_start, args, rng):
+    spread = np.array([25.0, 30.0, 0.5, 0.8, 3.0, 25.0])
+    positions = np.empty((n_walkers, theta_start.size), dtype=float)
+
+    for i in range(n_walkers):
+        candidate = theta_start + spread * rng.normal(size=theta_start.size)
+        attempts = 0
+        while not np.isfinite(log_probability(candidate, *args)) and attempts < 100:
+            candidate = theta_start + spread * rng.normal(size=theta_start.size)
+            attempts += 1
+        positions[i] = candidate
+
+    return positions
+
+
+def run_emcee_fit(binned, n_walkers, n_steps, n_burn, seed):
+    if n_burn >= n_steps:
+        raise ValueError("--burn must be smaller than --steps.")
+
+    phase = binned["phase_center"].to_numpy(dtype=float)
+    time_bjd = T0_TRANSIT + (phase - PHASE_TRANSIT) * P_ORB
+    flux = binned["flux_median"].to_numpy(dtype=float)
+    flux_err = binned["flux_err"].to_numpy(dtype=float)
+
+    valid = np.isfinite(time_bjd) & np.isfinite(flux) & np.isfinite(flux_err) & (flux_err > 0.0)
+    time_bjd = time_bjd[valid]
+    flux = flux[valid]
+    flux_err = flux_err[valid]
+
+    if time_bjd.size < 30:
+        raise RuntimeError("Too few valid binned points for EMCEE.")
+
+    LOG.info("Computing fixed transit/eclipse-window shapes on the binned phase grid.")
+    transit_shape_binned = compute_transit_shape(time_bjd)
+    eclipse_window_binned = compute_eclipse_window(time_bjd)
+    hours_since_peri_binned = hours_since_periastron(time_bjd)
+
+    args = (transit_shape_binned, eclipse_window_binned, hours_since_peri_binned, flux, flux_err)
+
+    theta_init = np.array([322.0, 856.0, 5.4, 5.5, 10.3, 100.0])
+    theta_start = preoptimize_start(theta_init, args)
+
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
+
+    p0 = initialize_walkers(n_walkers, theta_start, args, rng)
+
+    sampler = emcee.EnsembleSampler(n_walkers, theta_start.size, log_probability, args=args)
+
+    LOG.info("Running EMCEE: %d walkers, %d steps, %d burn-in.", n_walkers, n_steps, n_burn)
     sampler.run_mcmc(p0, n_steps, progress=True)
 
-    chain = sampler.get_chain(discard=burnin, flat=True)
-    logprob = sampler.get_log_prob(discard=burnin, flat=True)
+    flat_chain = sampler.get_chain(discard=n_burn, flat=True)
+    flat_log_prob = sampler.get_log_prob(discard=n_burn, flat=True)
 
-    idx = np.argmax(logprob)
-    theta_map = chain[idx]
+    best_index = int(np.argmax(flat_log_prob))
+    theta_map = flat_chain[best_index]
 
-    print("EMCEE MAP:")
-    print(f"  F_min_ppm   = {theta_map[0]:.1f}")
-    print(f"  F_peak_ppm  = {theta_map[1]:.1f}")
-    print(f"  t_peak_hr   = {theta_map[2]:.2f}")
-    print(f"  tau_rise_hr = {theta_map[3]:.2f}")
-    print(f"  tau_decay_hr= {theta_map[4]:.2f}")
-    print(f"  sigma_ppm   = exp({theta_map[5]:.2f}) = {np.exp(theta_map[5]):.1f} ppm")
+    LOG.info("Best log-probability in chain: %.2f (sample %d of %d).",
+              flat_log_prob[best_index], best_index, flat_chain.shape[0])
 
-    return chain, theta_map
-
-def plot_fig1_style(df: pd.DataFrame,
-                    binned: pd.DataFrame,
-                    theta_map: np.ndarray,
-                    outprefix: str) -> None:
-    outprefix = Path(outprefix)
-
-    phase_b = binned["phase_center"].to_numpy(dtype=float)
-    flux_b = binned["flux_median"].to_numpy(dtype=float)
-
-    # Model on fine phase grid using MAP parameters.
-    phase_grid = np.linspace(-0.5, 0.5, 4000)
-    t_grid = T0_TRANSIT + phase_grid * P_ORB
-    model_flux = system_model_flux(
-        t_grid,
-        theta_map[:5],
+    summary = FitSummary(
+        f_min_ppm=float(theta_map[0]),
+        c1_ppm=float(theta_map[1]),
+        t_peak_hr=float(theta_map[2]),
+        tau_rise_hr=float(theta_map[3]),
+        tau_decay_hr=float(theta_map[4]),
+        jitter_ppm=float(theta_map[5]),
     )
 
-    # Transit center.
-    phase_trans_center = 0.0
+    return summary, flat_chain, flat_log_prob
 
-    # Occultation center from geometry.
-    omega = np.deg2rad(OMEGA_DEG)
-    f_occ = 1.5 * np.pi - omega
-    tan_half_E_occ = np.sqrt((1.0 - ECC) / (1.0 + ECC)) * np.tan(0.5 * f_occ)
-    E_occ = 2.0 * np.arctan(tan_half_E_occ)
-    M_occ = E_occ - ECC * np.sin(E_occ)
-    phase_occ_center = ((M_occ / (2.0 * np.pi)) % 1.0)
-    if phase_occ_center > 0.5:
-        phase_occ_center -= 1.0
 
-    # Matplotlib style
+def fixed_dewit_summary():
+    return FitSummary(
+        f_min_ppm=322.0, c1_ppm=856.0, t_peak_hr=5.40,
+        tau_rise_hr=5.5, tau_decay_hr=10.3, jitter_ppm=100.0,
+    )
+
+
+def fit_summary_to_theta_astro(summary):
+    return np.array([
+        summary.f_min_ppm, summary.c1_ppm, summary.t_peak_hr,
+        summary.tau_rise_hr, summary.tau_decay_hr,
+    ], dtype=float)
+
+
+def plot_dewit_fig1_style(binned, fit, output_png):
+    theta_astro = fit_summary_to_theta_astro(fit)
+
+    phase_grid = np.linspace(0.0, 1.0, 20001, endpoint=False)
+    time_grid = T0_TRANSIT + (phase_grid - PHASE_TRANSIT) * P_ORB
+    model_grid = astrophysical_flux(time_grid, theta_astro)
+
+    phase_bin = binned["phase_center"].to_numpy(dtype=float)
+    flux_bin = binned["flux_median"].to_numpy(dtype=float)
+
+    baseline_mask = (
+        (circular_phase_distance(phase_bin, PHASE_TRANSIT) > 0.04)
+        & (circular_phase_distance(phase_bin, PHASE_OCCULTATION) > 0.04)
+        & (circular_phase_distance(phase_bin, PHASE_PERIASTRON) > 0.07)
+    )
+
+    display_baseline = robust_location(flux_bin[baseline_mask])
+    if not np.isfinite(display_baseline) or display_baseline <= 0.0:
+        display_baseline = robust_location(flux_bin)
+
+    flux_plot = flux_bin / display_baseline
+    model_plot = model_grid / display_baseline
+
+    transit_phase = centered_phase(phase_bin, PHASE_TRANSIT)
+    transit_grid = centered_phase(phase_grid, PHASE_TRANSIT)
+    occultation_phase = centered_phase(phase_bin, PHASE_OCCULTATION)
+    occultation_grid = centered_phase(phase_grid, PHASE_OCCULTATION)
+
+    transit_window = 0.030
+    occultation_window = 0.030
+
+    transit_points = np.abs(transit_phase) <= transit_window
+    transit_model = np.abs(transit_grid) <= transit_window
+    occultation_points = np.abs(occultation_phase) <= occultation_window
+    occultation_model = np.abs(occultation_grid) <= occultation_window
+
     plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 12,
-        "axes.linewidth": 1.1,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "xtick.top": True,
-        "ytick.right": True,
+        "font.family": "serif", "font.size": 11, "axes.linewidth": 1.0,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.top": True, "ytick.right": True,
     })
 
-    fig, axes = plt.subplots(3, 1, figsize=(8.5, 10.0), dpi=160, sharex=False)
+    fig = plt.figure(figsize=(9.4, 6.6), dpi=180)
+    grid = fig.add_gridspec(nrows=2, ncols=2, height_ratios=[1.08, 1.0], hspace=0.34, wspace=0.30)
 
-    # Panel A: full phase curve.
-    ax = axes[0]
-    ax.plot(phase_b, flux_b, "k.", ms=3.0, alpha=0.9)
-    ax.plot(phase_grid, model_flux, color="green", lw=1.2, alpha=0.9)
-    ax.axhline(1.0, ls="--", lw=0.9, c="0.6")
-    ax.set_xlim(-0.5, 0.5)
-    ax.set_ylabel("Relative flux")
-    ax.text(0.02, 0.92, "A", transform=ax.transAxes, fontweight="bold")
-    ax.grid(alpha=0.15)
+    ax_a = fig.add_subplot(grid[0, :])
+    ax_b = fig.add_subplot(grid[1, 0])
+    ax_c = fig.add_subplot(grid[1, 1])
 
-    # Panel B: transit zoom.
-    ax = axes[1]
-    ax.plot(phase_b, flux_b, "k.", ms=3.0, alpha=0.9)
-    ax.plot(phase_grid, model_flux, color="green", lw=1.2, alpha=0.9)
-    ax.axhline(1.0, ls="--", lw=0.9, c="0.6")
-    ax.set_xlim(phase_trans_center - 0.08, phase_trans_center + 0.08)
-    ax.set_ylabel("Relative flux")
-    ax.text(0.02, 0.92, "B", transform=ax.transAxes, fontweight="bold")
-    ax.grid(alpha=0.15)
+    ax_a.plot(phase_bin, flux_plot, linestyle="none", marker="o", markersize=2.4,
+              color="black", alpha=0.9, rasterized=True, label="Binned photometry")
+    ax_a.plot(phase_grid, model_plot, color="#00b300", linewidth=1.6,
+              label="Best-fit model", zorder=4)
+    ax_a.set_xlim(0.0, 1.0)
+    ax_a.set_xlabel("Orbital Phase")
+    ax_a.set_ylabel(r"$F/F_\star$")
+    ax_a.legend(loc="upper right", frameon=False, handlelength=2.4)
+    ax_a.text(0.985, 0.94, "A", transform=ax_a.transAxes, ha="right", va="top", fontweight="bold")
 
-    # Panel C: occultation zoom.
-    ax = axes[2]
-    ax.plot(phase_b, flux_b, "k.", ms=3.0, alpha=0.9)
-    ax.plot(phase_grid, model_flux, color="green", lw=1.2, alpha=0.9)
-    ax.axhline(1.0, ls="--", lw=0.9, c="0.6")
-    ax.set_xlim(phase_occ_center - 0.08, phase_occ_center + 0.08)
-    ax.set_xlabel("Orbital phase")
-    ax.set_ylabel("Relative flux")
-    ax.text(0.02, 0.92, "C", transform=ax.transAxes, fontweight="bold")
-    ax.grid(alpha=0.15)
+    ax_b.plot(transit_phase[transit_points], (flux_plot[transit_points] - 1.0) * 1.0e6,
+              linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True)
+    ax_b.plot(transit_grid[transit_model], (model_plot[transit_model] - 1.0) * 1.0e6,
+              color="#00b300", linewidth=1.6, zorder=4)
+    ax_b.set_xlim(-transit_window, transit_window)
+    ax_b.set_xlabel("Orbital Phase (centered on transit)")
+    ax_b.set_ylabel(r"$(F/F_\star - 1)$ [ppm]")
+    ax_b.text(0.95, 0.92, "B", transform=ax_b.transAxes, ha="right", va="top", fontweight="bold")
 
-    fig.tight_layout()
-    # outpng = outprefix.with_suffix("_phase3_dewit_fig1.png")
-    # fig.savefig(outpng, bbox_inches="tight", dpi=300)
-    plt.show()
+    ax_c.plot(occultation_phase[occultation_points], (flux_plot[occultation_points] - 1.0) * 1.0e6,
+              linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True)
+    ax_c.plot(occultation_grid[occultation_model], (model_plot[occultation_model] - 1.0) * 1.0e6,
+              color="#00b300", linewidth=1.6, zorder=4)
+    ax_c.set_xlim(-occultation_window, occultation_window)
+    ax_c.set_xlabel("Orbital Phase (centered on occultation)")
+    ax_c.set_ylabel(r"$(F/F_\star - 1)$ [ppm]")
+    ax_c.text(0.95, 0.92, "C", transform=ax_c.transAxes, ha="right", va="top", fontweight="bold")
+
+    for axis in (ax_a, ax_b, ax_c):
+        axis.grid(alpha=0.12, linewidth=0.5)
+
+    fig.savefig(output_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    print(f"Saved Phase 3 Figure 1-style plot")
+    LOG.info("Saved Figure 1-style phase-curve plot: %s", output_png)
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Phase 3: de Wit 4.5 μm HAT-P-2b Figure 1-style reproduction."
-    )
-    ap.add_argument(
-        "--input",
-        default="output/phase1_hatp2b_45um_photometry.csv",
-        help="Phase 1 photometry CSV.",
-    )
-    ap.add_argument(
-        "--output-prefix",
-        default="output/phase3_hatp2b_45um",
-        help="Prefix for Phase 3 outputs (Figure 1-style plot).",
-    )
-    ap.add_argument(
-        "--bin-width",
-        type=float,
-        default=DEFAULT_BIN_WIDTH,
-        help="Phase bin width (default 0.00025).",
-    )
-    ap.add_argument(
-        "--skip-emcee",
-        action="store_true",
-        help="Skip EMCEE and use fixed de Wit Lorentzian model.",
-    )
-    args = ap.parse_args()
 
-    outprefix = Path(args.output_prefix)
-    outprefix.parent.mkdir(parents=True, exist_ok=True)
+def standardize_phase1_columns(df):
+    df = df.copy()
+    df.columns = [str(column).strip() for column in df.columns]
 
-    # Load Phase 1 CSV.
-    df = pd.read_csv(args.input)
-    df.columns = [c.strip() for c in df.columns]
+    mapping = {}
+    canonical = {
+        "globalindex": "global_index", "aorid": "aor_id",
+        "visitlabel": "visit_label", "visitindex": "visit_index",
+        "segmentid": "segment_id", "bjdutc": "bjd_utc",
+        "fluxraw": "flux_raw", "fluxnormvisit": "flux_norm_visit",
+        "fluxnormglobal": "flux_norm_global", "xcent": "x_cent",
+        "ycent": "y_cent", "frameok": "frame_ok",
+    }
 
-    # Normalize column names.
-    rename_map = {}
-    for c in df.columns:
-        cl = c.lower()
-        if cl == "aorid":
-            rename_map[c] = "aor_id"
-        elif cl == "globalindex":
-            rename_map[c] = "global_index"
-        elif cl == "bjdutc":
-            rename_map[c] = "bjd_utc"
-        elif cl in {"xcent", "x_cent"}:
-            rename_map[c] = "x_cent"
-        elif cl in {"ycent", "y_cent"}:
-            rename_map[c] = "y_cent"
-        elif cl == "fluxraw":
-            rename_map[c] = "flux_raw"
-        elif cl == "fluxnormglobal":
-            rename_map[c] = "flux_norm_global"
-        elif cl == "fluxnormvisit":
-            rename_map[c] = "flux_norm_visit"
-        elif cl == "frameok":
-            rename_map[c] = "frame_ok"
-        elif cl == "apertureradius":
-            rename_map[c] = "aperture_radius"
-        elif cl == "nhotpixfixedframe":
-            rename_map[c] = "n_hotpix_fixed_frame"
-        elif cl == "beta":
-            rename_map[c] = "beta"
-        elif cl == "segmentid":
-            rename_map[c] = "segment_id"
+    for column in df.columns:
+        compact = column.lower().replace("_", "").replace(" ", "")
+        if compact in canonical:
+            mapping[column] = canonical[compact]
 
-    df = df.rename(columns=rename_map)
+    return df.rename(columns=mapping)
 
-    required_cols = ["bjd_utc", "flux_norm_global", "x_cent", "y_cent"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required Phase 1 column: {col}")
+
+def load_phase1_photometry(input_csv):
+    df = pd.read_csv(input_csv)
+    df = standardize_phase1_columns(df)
+
+    required = ["bjd_utc", "flux_norm_global", "x_cent", "y_cent", "beta"]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"Phase 1 CSV is missing required columns: {missing}")
 
     if "global_index" not in df.columns:
-        df["global_index"] = np.arange(len(df), dtype=int)
+        df["global_index"] = np.arange(df.shape[0], dtype=int)
+    if "aor_id" not in df.columns:
+        df["aor_id"] = "all"
 
+    if "frame_ok" in df.columns:
+        keep = as_bool_mask(df["frame_ok"])
+        df = df.loc[keep].copy()
+
+    finite = (
+        np.isfinite(df["bjd_utc"].to_numpy(float))
+        & np.isfinite(df["flux_norm_global"].to_numpy(float))
+        & np.isfinite(df["x_cent"].to_numpy(float))
+        & np.isfinite(df["y_cent"].to_numpy(float))
+        & np.isfinite(df["beta"].to_numpy(float))
+        & (df["flux_norm_global"].to_numpy(float) > 0.0)
+    )
+
+    df = df.loc[finite].copy()
     df = df.sort_values(["bjd_utc", "global_index"]).reset_index(drop=True)
 
-    # Respect Phase 1 frame_ok (no new trimming).
-    if "frame_ok" in df.columns:
-        frame_ok = df["frame_ok"].astype(str).str.lower().isin(
-            ["true", "1", "t", "yes"]
-        ) | (df["frame_ok"] == 1)
-        df = df.loc[frame_ok].copy().reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError("No usable frames remain after Phase 1 selection.")
 
-    # Drop non-finite flux_norm_global.
-    df = df[np.isfinite(df["flux_norm_global"])].copy().reset_index(drop=True)
-    if len(df) == 0:
-        raise RuntimeError("No data left after Phase 1 frame_ok selection.")
+    return df
 
-    # Fixed Lorentzian-only phase model for IP map (planet only, no transit).
-    t_bjd = df["bjd_utc"].to_numpy(dtype=float)
-    fixed_model = fixed_phase_model_flux(t_bjd)
 
-    # Apply Lewis-style intrapixel correction on flux_norm_global.
-    flux_global = df["flux_norm_global"].to_numpy(dtype=float)
-    corrected_flux, sensitivity = apply_ip_correction(
-        flux_global=flux_global,
-        fixed_model=fixed_model,
-        x_cent=df["x_cent"].to_numpy(dtype=float),
-        y_cent=df["y_cent"].to_numpy(dtype=float),
-    )
-    df["ip_sensitivity"] = sensitivity
-    df["flux_corr_final"] = corrected_flux
+def posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm):
+    q16, q50, q84 = np.percentile(flat_chain, [16.0, 50.0, 84.0], axis=0)
 
-    # Phase-fold
-    df["phase"] = phase_fold(df["bjd_utc"].to_numpy(), period=P_ORB, t0=T0_TRANSIT)
+    data = {}
+    for i, name in enumerate(PARAM_NAMES):
+        data[f"{name}_p16"] = q16[i]
+        data[f"{name}_p50"] = q50[i]
+        data[f"{name}_p84"] = q84[i]
 
-    # Bin (binned is what we plot and fit)
-    binned = bin_phase(
-        df["phase"].to_numpy(),
-        df["flux_corr_final"].to_numpy(),
+    data["f_min_ppm_map"] = fit.f_min_ppm
+    data["c1_ppm_map"] = fit.c1_ppm
+    data["peak_flux_ppm_map"] = fit.f_min_ppm + fit.c1_ppm
+    data["t_peak_hr_map"] = fit.t_peak_hr
+    data["tau_rise_hr_map"] = fit.tau_rise_hr
+    data["tau_decay_hr_map"] = fit.tau_decay_hr
+    data["jitter_ppm_map"] = fit.jitter_ppm
+
+    data["eclipse_depth_ppm_fixed"] = ECLIPSE_DEPTH_PPM_FIXED
+    data["measured_occultation_depth_ppm"] = measured_eclipse_depth_ppm
+
+    data["transit_depth_ppm_fixed"] = TRANSIT_DEPTH_PPM
+    data["a_over_rs_derived"] = A_RS
+    data["stellar_density_cgs"] = STELLAR_DENSITY_CGS
+    data["period_days"] = P_ORB
+    data["t0_transit_bjd"] = T0_TRANSIT
+    data["t_periastron_ref_bjd"] = T_PERI_REF
+    data["t_occultation_ref_bjd"] = T_OCC_REF
+    data["phase_transit"] = PHASE_TRANSIT
+    data["phase_periastron"] = PHASE_PERIASTRON
+    data["phase_occultation"] = PHASE_OCCULTATION
+    data["eccentricity"] = ECC
+    data["omega_deg"] = OMEGA_DEG
+
+    return pd.DataFrame([data])
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="HAT-P-2b 4.5 um Phase 2 de Wit-style analysis.")
+    parser.add_argument("--phase1-csv", type=Path, default=Path("output/phase1_hatp2b_45um_photometry.csv"))
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument("--prefix", type=str, default="phase2_hatp2b_45um")
+    parser.add_argument("--bin-width", type=float, default=DEFAULT_BIN_WIDTH)
+    parser.add_argument("--walkers", type=int, default=DEFAULT_N_WALKERS)
+    parser.add_argument("--steps", type=int, default=DEFAULT_N_STEPS)
+    parser.add_argument("--burn", type=int, default=DEFAULT_N_BURN)
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--skip-emcee", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    global ECLIPSE_DEPTH_PPM_FIXED
+
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    if args.bin_width <= 0.0 or args.bin_width >= 1.0:
+        raise ValueError("--bin-width must lie in (0, 1).")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.output_dir / args.prefix
+
+    LOG.info("Loading Phase 1 product: %s", args.phase1_csv)
+    df = load_phase1_photometry(args.phase1_csv)
+    LOG.info("Loaded %d usable frames from %d AORs.", len(df), df["aor_id"].nunique())
+    LOG.info("Derived a/Rs = %.4f from stellar density %.3f g/cm^3.", A_RS, STELLAR_DENSITY_CGS)
+    LOG.info("Reference phases: transit=%.4f, periastron=%.4f, occultation=%.4f.",
+             PHASE_TRANSIT, PHASE_PERIASTRON, PHASE_OCCULTATION)
+
+    df = apply_pixel_map_per_aor(df)
+    df["phase"] = phase_fold_01(df["bjd_utc"].to_numpy(dtype=float))
+    df = normalize_per_aor_baseline(df)
+
+    binned = bin_phase_curve(
+        df["phase"].to_numpy(dtype=float),
+        df["flux_corr_final"].to_numpy(dtype=float),
         bin_width=args.bin_width,
     )
 
-    if len(binned) < 10:
-        raise RuntimeError("Too few binned points for EMCEE / plotting.")
+    if len(binned) < 30:
+        raise RuntimeError(f"Only {len(binned)} populated phase bins; cannot fit reliably.")
 
-    # EMCEE on Lorentzian+transit model (binned data).
-    if args.skip_emcee:
-        theta_map = np.array([
-            PHASE_MIN_PPM,
-            PHASE_PEAK_PPM,
-            PHASE_PEAK_OFFSET_HR,
-            PHASE_RISE_HR,
-            PHASE_DECAY_HR,
-            np.log(BASE_PHOT_NOISE_PPM),
-        ])
+    LOG.info("Created %d populated phase bins.", len(binned))
+
+    measured_eclipse_depth_ppm = measure_eclipse_depth_ppm(binned)
+    if np.isfinite(measured_eclipse_depth_ppm) and measured_eclipse_depth_ppm > 0.0:
+        ECLIPSE_DEPTH_PPM_FIXED = measured_eclipse_depth_ppm
     else:
-        phase_b = binned["phase_center"].to_numpy(dtype=float)
-        flux_b = binned["flux_median"].to_numpy(dtype=float)
-        err_b = binned["flux_err"].to_numpy(dtype=float)
-        err_b[~np.isfinite(err_b)] = BASE_PHOT_NOISE_PPM / 1e6
-        _, theta_map = run_emcee_lorentzian(
-            phase=phase_b,
-            flux=flux_b,
-            flux_err=err_b,
-            n_walkers=48,
-            n_steps=3000,
-            burnin=1500,
+        LOG.warning(
+            "Could not measure eclipse depth from data; falling back to %.1f ppm.",
+            ECLIPSE_DEPTH_PPM_FIXED,
+        )
+    LOG.info("Fixed eclipse depth (measured from data): %.1f ppm.", ECLIPSE_DEPTH_PPM_FIXED)
+
+    if args.skip_emcee:
+        fit = fixed_dewit_summary()
+        flat_chain = np.array([[
+            fit.f_min_ppm, fit.c1_ppm, fit.t_peak_hr,
+            fit.tau_rise_hr, fit.tau_decay_hr, fit.jitter_ppm,
+        ]], dtype=float)
+        LOG.info("Skipping EMCEE; using de Wit reference heating shape.")
+    else:
+        fit, flat_chain, _ = run_emcee_fit(
+            binned=binned, n_walkers=args.walkers, n_steps=args.steps,
+            n_burn=args.burn, seed=args.seed,
         )
 
-    # Single Figure 1-style plot.
-    plot_fig1_style(df, binned, theta_map, str(outprefix))
+    LOG.info(
+        "MAP heating fit: Fmin=%.1f ppm, c1=%.1f ppm (peak=%.1f ppm), "
+        "tpeak=%.3f hr, trise=%.3f hr, tdecay=%.3f hr, jitter=%.1f ppm. "
+        "Fixed eclipse depth=%.1f ppm.",
+        fit.f_min_ppm, fit.c1_ppm, fit.f_min_ppm + fit.c1_ppm,
+        fit.t_peak_hr, fit.tau_rise_hr, fit.tau_decay_hr, fit.jitter_ppm,
+        ECLIPSE_DEPTH_PPM_FIXED,
+    )
+
+    theta_astro = fit_summary_to_theta_astro(fit)
+
+    df["model_flux"] = astrophysical_flux(df["bjd_utc"].to_numpy(dtype=float), theta_astro)
+    df["residual_flux"] = df["flux_corr_final"].to_numpy(dtype=float) - df["model_flux"].to_numpy(dtype=float)
+    df["residual_ppm"] = df["residual_flux"] * 1.0e6
+
+    binned_time = T0_TRANSIT + (binned["phase_center"].to_numpy(dtype=float) - PHASE_TRANSIT) * P_ORB
+    binned["model_flux"] = astrophysical_flux(binned_time, theta_astro)
+    binned["residual_flux"] = binned["flux_median"].to_numpy(dtype=float) - binned["model_flux"].to_numpy(dtype=float)
+    binned["residual_ppm"] = binned["residual_flux"] * 1.0e6
+
+    lightcurve_path = prefix.with_name(prefix.name + "_corrected_lightcurve.csv")
+    binned_path = prefix.with_name(prefix.name + "_phase_binned.csv")
+    summary_path = prefix.with_name(prefix.name + "_posterior_summary.csv")
+    figure_path = prefix.with_name(prefix.name + "_fig1_no_pulsations.png")
+
+    df.to_csv(lightcurve_path, index=False)
+    binned.to_csv(binned_path, index=False)
+    posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm).to_csv(summary_path, index=False)
+
+    plot_dewit_fig1_style(binned=binned, fit=fit, output_png=figure_path)
+
+    LOG.info("Saved corrected Phase 2 light curve: %s", lightcurve_path)
+    LOG.info("Saved binned phase curve: %s", binned_path)
+    LOG.info("Saved posterior summary: %s", summary_path)
+    LOG.info("Saved Figure 1 reproduction: %s", figure_path)
 
 
 if __name__ == "__main__":
