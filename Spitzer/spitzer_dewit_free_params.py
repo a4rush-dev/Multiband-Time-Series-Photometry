@@ -14,25 +14,19 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
-
 LOG = logging.getLogger(__name__)
 
-# Orbital ephemeris (de Wit et al. 2017).
 P_ORB = 5.6334675
 T0_TRANSIT = 2455288.84969
 ECC = 0.51023
 OMEGA_DEG = 188.44
 INC_DEG = 86.16
 
-# Stellar density (de Wit et al. 2017) used to derive a/Rs so the
-# secondary-eclipse geometry is physically consistent with the primary
-# transit geometry, rather than an arbitrary guess.
 STELLAR_DENSITY_CGS = 0.434
 G_CGS = 6.67430e-8
 
 
 def derive_a_over_rs(stellar_density_cgs: float, period_days: float) -> float:
-    """a/Rs from Kepler's third law and the mean stellar density."""
     period_seconds = period_days * 86400.0
     a_rs_cubed = stellar_density_cgs * G_CGS * period_seconds ** 2 / (3.0 * np.pi)
     return float(a_rs_cubed ** (1.0 / 3.0))
@@ -40,10 +34,9 @@ def derive_a_over_rs(stellar_density_cgs: float, period_days: float) -> float:
 
 A_RS = derive_a_over_rs(STELLAR_DENSITY_CGS, P_ORB)
 
-TRANSIT_DEPTH_PPM = 4941.0
-
-LD_LAW = "quadratic"
-LD_COEFFS = [0.06, 0.23]
+TRANSIT_DEPTH_PPM_GUESS = 4941.0
+LD_U1_GUESS = 0.06
+LD_U2_GUESS = 0.23
 
 EXPOSURE_SECONDS = 0.4
 EXPOSURE_DAYS = EXPOSURE_SECONDS / 86400.0
@@ -64,15 +57,24 @@ PHASE_WRAP_OFFSET = 0.05
 
 ECLIPSE_EVENT_HALF_WIDTH = 0.010
 ECLIPSE_BASELINE_HALF_WIDTH = 0.028
+ECLIPSE_DEPTH_PRIOR_SIGMA_PPM = 120.0
 
-DEFAULT_N_WALKERS = 64
-DEFAULT_N_STEPS = 8000
-DEFAULT_N_BURN = 3000
+DEFAULT_N_WALKERS = 72
+DEFAULT_N_STEPS = 9000
+DEFAULT_N_BURN = 3500
 RANDOM_SEED = 24601
 
-PARAM_NAMES = ["f_min_ppm", "c1_ppm", "t_peak_hr", "tau_rise_hr", "tau_decay_hr", "jitter_ppm"]
+PARAM_NAMES = [
+    "depth_ppm", "u1", "u2", "eclipse_depth_ppm",
+    "f_min_ppm", "c1_ppm", "t_peak_hr", "tau_rise_hr", "tau_decay_hr",
+    "jitter_ppm",
+]
 
 PRIOR_BOUNDS = {
+    "depth_ppm": (3000.0, 7000.0),
+    "u1": (0.0, 1.0),
+    "u2": (0.0, 1.0),
+    "eclipse_depth_ppm": (0.0, 3000.0),
     "f_min_ppm": (-1000.0, 3000.0),
     "c1_ppm": (0.0, 4000.0),
     "t_peak_hr": (-20.0, 40.0),
@@ -81,8 +83,6 @@ PRIOR_BOUNDS = {
     "jitter_ppm": (0.0, 4000.0),
 }
 
-
-ECLIPSE_DEPTH_PPM_FIXED = 900.0
 
 def mad_std(values):
     values = np.asarray(values, dtype=float)
@@ -157,8 +157,6 @@ PHASE_TRANSIT = phase_fold_01(np.array([T0_TRANSIT]))[0]
 PHASE_OCCULTATION = phase_fold_01(np.array([T_OCC_REF]))[0]
 PHASE_PERIASTRON = phase_fold_01(np.array([T_PERI_REF]))[0]
 
-RP_RS = float(np.sqrt(TRANSIT_DEPTH_PPM * 1.0e-6))
-
 
 def nearest_periodic_epoch(reference_event_bjd, query_times_bjd, period_days=P_ORB):
     query_times_bjd = np.asarray(query_times_bjd, dtype=float)
@@ -172,25 +170,25 @@ def hours_since_periastron(time_bjd):
     return (time_bjd - t_peri) * 24.0
 
 
-def make_geometry_params():
+def make_geometry_params(rp_rs, u1, u2):
     params = batman.TransitParams()
     params.t0 = T0_TRANSIT
     params.per = P_ORB
-    params.rp = RP_RS
+    params.rp = rp_rs
     params.a = A_RS
     params.inc = INC_DEG
     params.ecc = ECC
     params.w = OMEGA_DEG
     params.t_secondary = T_OCC_REF
-    params.limb_dark = LD_LAW
-    params.u = LD_COEFFS
+    params.limb_dark = "quadratic"
+    params.u = [u1, u2]
     params.fp = 0.0
     return params
 
 
-def compute_transit_shape(time_bjd):
+def compute_transit_shape(time_bjd, rp_rs, u1, u2):
     time_bjd = np.asarray(time_bjd, dtype=float)
-    params = make_geometry_params()
+    params = make_geometry_params(rp_rs, u1, u2)
     model = batman.TransitModel(
         params, time_bjd, transittype="primary",
         supersample_factor=BATMAN_SUPERSAMPLE, exp_time=EXPOSURE_DAYS,
@@ -198,9 +196,9 @@ def compute_transit_shape(time_bjd):
     return model.light_curve(params)
 
 
-def compute_eclipse_window(time_bjd):
+def compute_eclipse_window(time_bjd, rp_rs):
     time_bjd = np.asarray(time_bjd, dtype=float)
-    params = make_geometry_params()
+    params = make_geometry_params(rp_rs, 0.0, 0.0)
     params.fp = 1.0
     params.limb_dark = "uniform"
     params.u = []
@@ -209,8 +207,8 @@ def compute_eclipse_window(time_bjd):
         supersample_factor=BATMAN_SUPERSAMPLE, exp_time=EXPOSURE_DAYS,
     )
     unit_secondary_flux = model.light_curve(params)
-    visibility = unit_secondary_flux - 1.0  # 1 outside eclipse, 0 at full eclipse
-    return 1.0 - visibility  # 0 outside eclipse, 1 at full eclipse
+    visibility = unit_secondary_flux - 1.0
+    return 1.0 - visibility
 
 
 def asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr):
@@ -225,18 +223,25 @@ def asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, ta
     return f_min_ppm + c1_ppm / (u * u + 1.0)
 
 
-def astrophysical_flux_from_shapes(transit_shape, eclipse_window, hours_since_peri, theta_astro):
-    f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr = theta_astro
-    fp_ppm = asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr)
-    return transit_shape + fp_ppm * 1.0e-6 - (ECLIPSE_DEPTH_PPM_FIXED * 1.0e-6) * eclipse_window
-
-
-def astrophysical_flux(time_bjd, theta_astro):
+def astrophysical_flux(time_bjd, theta):
     time_bjd = np.asarray(time_bjd, dtype=float)
-    transit_shape = compute_transit_shape(time_bjd)
-    eclipse_window = compute_eclipse_window(time_bjd)
+    (
+        depth_ppm, u1, u2, eclipse_depth_ppm,
+        f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr,
+        jitter_ppm,
+    ) = theta
+
+    rp_rs = np.sqrt(max(float(depth_ppm), 1.0) / 1.0e6)
+    transit_shape = compute_transit_shape(time_bjd, rp_rs, u1, u2)
+    eclipse_window = compute_eclipse_window(time_bjd, rp_rs)
     hours_since_peri = hours_since_periastron(time_bjd)
-    return astrophysical_flux_from_shapes(transit_shape, eclipse_window, hours_since_peri, theta_astro)
+    fp_ppm = asymmetric_lorentzian_ppm(hours_since_peri, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr)
+
+    return (
+        transit_shape
+        + fp_ppm * 1.0e-6
+        - (eclipse_depth_ppm * 1.0e-6) * eclipse_window
+    )
 
 
 def standardized_coordinates(x_cent, y_cent, beta):
@@ -464,6 +469,10 @@ def measure_eclipse_depth_ppm(binned):
 
 @dataclass(frozen=True)
 class FitSummary:
+    depth_ppm: float
+    u1: float
+    u2: float
+    eclipse_depth_ppm: float
     f_min_ppm: float
     c1_ppm: float
     t_peak_hr: float
@@ -472,23 +481,23 @@ class FitSummary:
     jitter_ppm: float
 
 
-def log_prior(theta):
+def log_prior(theta, eclipse_depth_prior_mean_ppm):
     for value, name in zip(theta, PARAM_NAMES):
         lo, hi = PRIOR_BOUNDS[name]
         if not (lo <= value <= hi):
             return -np.inf
-    return 0.0
+
+    lp = 0.0
+    eclipse_depth_ppm = theta[PARAM_NAMES.index("eclipse_depth_ppm")]
+    if np.isfinite(eclipse_depth_prior_mean_ppm):
+        lp += -0.5 * ((eclipse_depth_ppm - eclipse_depth_prior_mean_ppm) / ECLIPSE_DEPTH_PRIOR_SIGMA_PPM) ** 2
+
+    return lp
 
 
-def log_likelihood(theta, transit_shape_binned, eclipse_window_binned, hours_since_peri_binned, flux_binned, err_binned):
-    f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr, jitter_ppm = theta
-
-    fp_ppm = asymmetric_lorentzian_ppm(hours_since_peri_binned, f_min_ppm, c1_ppm, t_peak_hr, tau_rise_hr, tau_decay_hr)
-    model = (
-        transit_shape_binned
-        + fp_ppm * 1.0e-6
-        - (ECLIPSE_DEPTH_PPM_FIXED * 1.0e-6) * eclipse_window_binned
-    )
+def log_likelihood(theta, time_bjd, flux_binned, err_binned):
+    model = astrophysical_flux(time_bjd, theta)
+    jitter_ppm = theta[PARAM_NAMES.index("jitter_ppm")]
 
     sigma2 = err_binned * err_binned + (jitter_ppm * 1.0e-6) ** 2
     resid2 = (flux_binned - model) ** 2
@@ -496,11 +505,11 @@ def log_likelihood(theta, transit_shape_binned, eclipse_window_binned, hours_sin
     return float(-0.5 * np.sum(resid2 / sigma2 + np.log(2.0 * np.pi * sigma2)))
 
 
-def log_probability(theta, *args):
-    lp = log_prior(theta)
+def log_probability(theta, time_bjd, flux_binned, err_binned, eclipse_depth_prior_mean_ppm):
+    lp = log_prior(theta, eclipse_depth_prior_mean_ppm)
     if not np.isfinite(lp):
         return -np.inf
-    ll = log_likelihood(theta, *args)
+    ll = log_likelihood(theta, time_bjd, flux_binned, err_binned)
     if not np.isfinite(ll):
         return -np.inf
     return lp + ll
@@ -515,25 +524,36 @@ def preoptimize_start(theta_init, args):
 
     result = minimize(
         neg_log_prob_safe, theta_init, method="Nelder-Mead",
-        options={"maxiter": 8000, "xatol": 1.0e-7, "fatol": 1.0e-7},
+        options={"maxiter": 12000, "xatol": 1.0e-7, "fatol": 1.0e-7},
     )
     theta_start = result.x if result.success else theta_init
 
     LOG.info("Pre-optimization success=%s", result.success)
     for name, value in zip(PARAM_NAMES, theta_start):
-        LOG.info("  start %-14s = %9.3f", name, value)
+        LOG.info("  start %-18s = %9.3f", name, value)
 
     return theta_start
 
 
 def initialize_walkers(n_walkers, theta_start, args, rng):
-    spread = np.array([25.0, 30.0, 0.5, 0.8, 3.0, 25.0])
+    spread = np.array([
+        200.0,
+        0.05,
+        0.05,
+        60.0,
+        25.0,
+        30.0,
+        0.5,
+        0.8,
+        3.0,
+        25.0,
+    ])
     positions = np.empty((n_walkers, theta_start.size), dtype=float)
 
     for i in range(n_walkers):
         candidate = theta_start + spread * rng.normal(size=theta_start.size)
         attempts = 0
-        while not np.isfinite(log_probability(candidate, *args)) and attempts < 100:
+        while not np.isfinite(log_probability(candidate, *args)) and attempts < 150:
             candidate = theta_start + spread * rng.normal(size=theta_start.size)
             attempts += 1
         positions[i] = candidate
@@ -558,21 +578,34 @@ def run_emcee_fit(binned, n_walkers, n_steps, n_burn, seed):
     if time_bjd.size < 30:
         raise RuntimeError("Too few valid binned points for EMCEE.")
 
-    LOG.info("Computing fixed transit/eclipse-window shapes on the binned phase grid.")
-    transit_shape_binned = compute_transit_shape(time_bjd)
-    eclipse_window_binned = compute_eclipse_window(time_bjd)
-    hours_since_peri_binned = hours_since_periastron(time_bjd)
+    eclipse_depth_prior_mean_ppm = measure_eclipse_depth_ppm(binned)
+    LOG.info(
+        "Eclipse-depth prior mean from data: %.1f ppm (prior sigma=%.1f ppm).",
+        eclipse_depth_prior_mean_ppm,
+        ECLIPSE_DEPTH_PRIOR_SIGMA_PPM,
+    )
 
-    args = (transit_shape_binned, eclipse_window_binned, hours_since_peri_binned, flux, flux_err)
+    args = (time_bjd, flux, flux_err, eclipse_depth_prior_mean_ppm)
 
-    theta_init = np.array([322.0, 856.0, 5.4, 5.5, 10.3, 100.0])
+    depth_init = TRANSIT_DEPTH_PPM_GUESS
+    eclipse_init = (
+        eclipse_depth_prior_mean_ppm
+        if np.isfinite(eclipse_depth_prior_mean_ppm) and eclipse_depth_prior_mean_ppm > 0.0
+        else 900.0
+    )
+
+    theta_init = np.array([
+        depth_init, LD_U1_GUESS, LD_U2_GUESS, eclipse_init,
+        322.0, 856.0, 5.4, 5.5, 10.3, 100.0,
+    ])
+
+    LOG.info("Pre-optimizing (BATMAN shapes now recomputed per-evaluation; this is slower)...")
     theta_start = preoptimize_start(theta_init, args)
 
     rng = np.random.default_rng(seed)
     np.random.seed(seed)
 
     p0 = initialize_walkers(n_walkers, theta_start, args, rng)
-
     sampler = emcee.EnsembleSampler(n_walkers, theta_start.size, log_probability, args=args)
 
     LOG.info("Running EMCEE: %d walkers, %d steps, %d burn-in.", n_walkers, n_steps, n_burn)
@@ -584,41 +617,51 @@ def run_emcee_fit(binned, n_walkers, n_steps, n_burn, seed):
     best_index = int(np.argmax(flat_log_prob))
     theta_map = flat_chain[best_index]
 
-    LOG.info("Best log-probability in chain: %.2f (sample %d of %d).",
-              flat_log_prob[best_index], best_index, flat_chain.shape[0])
-
-    summary = FitSummary(
-        f_min_ppm=float(theta_map[0]),
-        c1_ppm=float(theta_map[1]),
-        t_peak_hr=float(theta_map[2]),
-        tau_rise_hr=float(theta_map[3]),
-        tau_decay_hr=float(theta_map[4]),
-        jitter_ppm=float(theta_map[5]),
+    LOG.info(
+        "Best log-probability in chain: %.2f (sample %d of %d).",
+        flat_log_prob[best_index],
+        best_index,
+        flat_chain.shape[0],
     )
 
-    return summary, flat_chain, flat_log_prob
+    summary = FitSummary(
+        depth_ppm=float(theta_map[0]),
+        u1=float(theta_map[1]),
+        u2=float(theta_map[2]),
+        eclipse_depth_ppm=float(theta_map[3]),
+        f_min_ppm=float(theta_map[4]),
+        c1_ppm=float(theta_map[5]),
+        t_peak_hr=float(theta_map[6]),
+        tau_rise_hr=float(theta_map[7]),
+        tau_decay_hr=float(theta_map[8]),
+        jitter_ppm=float(theta_map[9]),
+    )
+
+    return summary, flat_chain, flat_log_prob, eclipse_depth_prior_mean_ppm
 
 
 def fixed_dewit_summary():
     return FitSummary(
-        f_min_ppm=322.0, c1_ppm=856.0, t_peak_hr=5.40,
-        tau_rise_hr=5.5, tau_decay_hr=10.3, jitter_ppm=100.0,
+        depth_ppm=TRANSIT_DEPTH_PPM_GUESS, u1=LD_U1_GUESS, u2=LD_U2_GUESS,
+        eclipse_depth_ppm=900.0, f_min_ppm=322.0, c1_ppm=856.0,
+        t_peak_hr=5.40, tau_rise_hr=5.5, tau_decay_hr=10.3, jitter_ppm=100.0,
     )
 
 
-def fit_summary_to_theta_astro(summary):
+def fit_summary_to_theta(summary):
     return np.array([
+        summary.depth_ppm, summary.u1, summary.u2, summary.eclipse_depth_ppm,
         summary.f_min_ppm, summary.c1_ppm, summary.t_peak_hr,
-        summary.tau_rise_hr, summary.tau_decay_hr,
+        summary.tau_rise_hr, summary.tau_decay_hr, summary.jitter_ppm,
     ], dtype=float)
 
 
 def plot_dewit_fig1_style(binned, fit, output_png):
-    theta_astro = fit_summary_to_theta_astro(fit)
+    theta = fit_summary_to_theta(fit)
 
     phase_grid = np.linspace(0.0, 1.0, 20001, endpoint=False)
     time_grid = T0_TRANSIT + (phase_grid - PHASE_TRANSIT) * P_ORB
-    model_grid = astrophysical_flux(time_grid, theta_astro)
+    model_grid = astrophysical_flux(time_grid, theta)
 
     phase_bin = binned["phase_center"].to_numpy(dtype=float)
     flux_bin = binned["flux_median"].to_numpy(dtype=float)
@@ -662,29 +705,38 @@ def plot_dewit_fig1_style(binned, fit, output_png):
     ax_b = fig.add_subplot(grid[1, 0])
     ax_c = fig.add_subplot(grid[1, 1])
 
-    ax_a.plot(phase_bin, flux_plot, linestyle="none", marker="o", markersize=2.4,
-              color="black", alpha=0.9, rasterized=True, label="Binned photometry")
-    ax_a.plot(phase_grid, model_plot, color="#00b300", linewidth=1.6,
-              label="Best-fit model", zorder=4)
+    ax_a.plot(
+        phase_bin, flux_plot, linestyle="none", marker="o", markersize=2.4,
+        color="black", alpha=0.9, rasterized=True, label="Binned photometry",
+    )
+    ax_a.plot(phase_grid, model_plot, color="#00b300", linewidth=1.6, label="Best-fit model", zorder=4)
     ax_a.set_xlim(0.0, 1.0)
     ax_a.set_xlabel("Orbital Phase")
     ax_a.set_ylabel(r"$F/F_\star$")
     ax_a.legend(loc="upper right", frameon=False, handlelength=2.4)
     ax_a.text(0.985, 0.94, "A", transform=ax_a.transAxes, ha="right", va="top", fontweight="bold")
 
-    ax_b.plot(transit_phase[transit_points], (flux_plot[transit_points] - 1.0) * 1.0e6,
-              linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True)
-    ax_b.plot(transit_grid[transit_model], (model_plot[transit_model] - 1.0) * 1.0e6,
-              color="#00b300", linewidth=1.6, zorder=4)
+    ax_b.plot(
+        transit_phase[transit_points], (flux_plot[transit_points] - 1.0) * 1.0e6,
+        linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True,
+    )
+    ax_b.plot(
+        transit_grid[transit_model], (model_plot[transit_model] - 1.0) * 1.0e6,
+        color="#00b300", linewidth=1.6, zorder=4,
+    )
     ax_b.set_xlim(-transit_window, transit_window)
     ax_b.set_xlabel("Orbital Phase (centered on transit)")
     ax_b.set_ylabel(r"$(F/F_\star - 1)$ [ppm]")
     ax_b.text(0.95, 0.92, "B", transform=ax_b.transAxes, ha="right", va="top", fontweight="bold")
 
-    ax_c.plot(occultation_phase[occultation_points], (flux_plot[occultation_points] - 1.0) * 1.0e6,
-              linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True)
-    ax_c.plot(occultation_grid[occultation_model], (model_plot[occultation_model] - 1.0) * 1.0e6,
-              color="#00b300", linewidth=1.6, zorder=4)
+    ax_c.plot(
+        occultation_phase[occultation_points], (flux_plot[occultation_points] - 1.0) * 1.0e6,
+        linestyle="none", marker="o", markersize=2.5, color="black", alpha=0.9, rasterized=True,
+    )
+    ax_c.plot(
+        occultation_grid[occultation_model], (model_plot[occultation_model] - 1.0) * 1.0e6,
+        color="#00b300", linewidth=1.6, zorder=4,
+    )
     ax_c.set_xlim(-occultation_window, occultation_window)
     ax_c.set_xlabel("Orbital Phase (centered on occultation)")
     ax_c.set_ylabel(r"$(F/F_\star - 1)$ [ppm]")
@@ -757,7 +809,7 @@ def load_phase1_photometry(input_csv):
     return df
 
 
-def posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm):
+def posterior_summary_dataframe(flat_chain, fit, eclipse_depth_prior_mean_ppm):
     q16, q50, q84 = np.percentile(flat_chain, [16.0, 50.0, 84.0], axis=0)
 
     data = {}
@@ -766,6 +818,11 @@ def posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm):
         data[f"{name}_p50"] = q50[i]
         data[f"{name}_p84"] = q84[i]
 
+    data["depth_ppm_map"] = fit.depth_ppm
+    data["u1_map"] = fit.u1
+    data["u2_map"] = fit.u2
+    data["eclipse_depth_ppm_map"] = fit.eclipse_depth_ppm
+    data["eclipse_depth_prior_mean_ppm"] = eclipse_depth_prior_mean_ppm
     data["f_min_ppm_map"] = fit.f_min_ppm
     data["c1_ppm_map"] = fit.c1_ppm
     data["peak_flux_ppm_map"] = fit.f_min_ppm + fit.c1_ppm
@@ -774,21 +831,18 @@ def posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm):
     data["tau_decay_hr_map"] = fit.tau_decay_hr
     data["jitter_ppm_map"] = fit.jitter_ppm
 
-    data["eclipse_depth_ppm_fixed"] = ECLIPSE_DEPTH_PPM_FIXED
-    data["measured_occultation_depth_ppm"] = measured_eclipse_depth_ppm
-
-    data["transit_depth_ppm_fixed"] = TRANSIT_DEPTH_PPM
-    data["a_over_rs_derived"] = A_RS
+    data["a_over_rs_fixed"] = A_RS
     data["stellar_density_cgs"] = STELLAR_DENSITY_CGS
-    data["period_days"] = P_ORB
-    data["t0_transit_bjd"] = T0_TRANSIT
+    data["period_days_fixed"] = P_ORB
+    data["t0_transit_bjd_fixed"] = T0_TRANSIT
+    data["eccentricity_fixed"] = ECC
+    data["omega_deg_fixed"] = OMEGA_DEG
+    data["inc_deg_fixed"] = INC_DEG
     data["t_periastron_ref_bjd"] = T_PERI_REF
     data["t_occultation_ref_bjd"] = T_OCC_REF
     data["phase_transit"] = PHASE_TRANSIT
     data["phase_periastron"] = PHASE_PERIASTRON
     data["phase_occultation"] = PHASE_OCCULTATION
-    data["eccentricity"] = ECC
-    data["omega_deg"] = OMEGA_DEG
 
     return pd.DataFrame([data])
 
@@ -808,8 +862,6 @@ def parse_args():
 
 
 def main():
-    global ECLIPSE_DEPTH_PPM_FIXED
-
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -822,9 +874,20 @@ def main():
     LOG.info("Loading Phase 1 product: %s", args.phase1_csv)
     df = load_phase1_photometry(args.phase1_csv)
     LOG.info("Loaded %d usable frames from %d AORs.", len(df), df["aor_id"].nunique())
-    LOG.info("Derived a/Rs = %.4f from stellar density %.3f g/cm^3.", A_RS, STELLAR_DENSITY_CGS)
-    LOG.info("Reference phases: transit=%.4f, periastron=%.4f, occultation=%.4f.",
-             PHASE_TRANSIT, PHASE_PERIASTRON, PHASE_OCCULTATION)
+    LOG.info(
+        "Fixed orbital geometry: a/Rs=%.4f (from stellar density), P=%.7f d, e=%.5f, w=%.2f deg, i=%.2f deg.",
+        A_RS,
+        P_ORB,
+        ECC,
+        OMEGA_DEG,
+        INC_DEG,
+    )
+    LOG.info(
+        "Reference phases: transit=%.4f, periastron=%.4f, occultation=%.4f.",
+        PHASE_TRANSIT,
+        PHASE_PERIASTRON,
+        PHASE_OCCULTATION,
+    )
 
     df = apply_pixel_map_per_aor(df)
     df["phase"] = phase_fold_01(df["bjd_utc"].to_numpy(dtype=float))
@@ -841,46 +904,34 @@ def main():
 
     LOG.info("Created %d populated phase bins.", len(binned))
 
-    measured_eclipse_depth_ppm = measure_eclipse_depth_ppm(binned)
-    if np.isfinite(measured_eclipse_depth_ppm) and measured_eclipse_depth_ppm > 0.0:
-        ECLIPSE_DEPTH_PPM_FIXED = measured_eclipse_depth_ppm
-    else:
-        LOG.warning(
-            "Could not measure eclipse depth from data; falling back to %.1f ppm.",
-            ECLIPSE_DEPTH_PPM_FIXED,
-        )
-    LOG.info("Fixed eclipse depth (measured from data): %.1f ppm.", ECLIPSE_DEPTH_PPM_FIXED)
-
     if args.skip_emcee:
         fit = fixed_dewit_summary()
-        flat_chain = np.array([[
-            fit.f_min_ppm, fit.c1_ppm, fit.t_peak_hr,
-            fit.tau_rise_hr, fit.tau_decay_hr, fit.jitter_ppm,
-        ]], dtype=float)
-        LOG.info("Skipping EMCEE; using de Wit reference heating shape.")
+        flat_chain = np.array([fit_summary_to_theta(fit)], dtype=float)
+        eclipse_depth_prior_mean_ppm = measure_eclipse_depth_ppm(binned)
+        LOG.info("Skipping EMCEE; using de Wit reference parameter guesses.")
     else:
-        fit, flat_chain, _ = run_emcee_fit(
+        fit, flat_chain, _, eclipse_depth_prior_mean_ppm = run_emcee_fit(
             binned=binned, n_walkers=args.walkers, n_steps=args.steps,
             n_burn=args.burn, seed=args.seed,
         )
 
     LOG.info(
-        "MAP heating fit: Fmin=%.1f ppm, c1=%.1f ppm (peak=%.1f ppm), "
-        "tpeak=%.3f hr, trise=%.3f hr, tdecay=%.3f hr, jitter=%.1f ppm. "
-        "Fixed eclipse depth=%.1f ppm.",
+        "MAP fit: depth=%.1f ppm, u1=%.3f, u2=%.3f, eclipse_depth=%.1f ppm, "
+        "Fmin=%.1f ppm, c1=%.1f ppm (peak=%.1f ppm), tpeak=%.3f hr, "
+        "trise=%.3f hr, tdecay=%.3f hr, jitter=%.1f ppm.",
+        fit.depth_ppm, fit.u1, fit.u2, fit.eclipse_depth_ppm,
         fit.f_min_ppm, fit.c1_ppm, fit.f_min_ppm + fit.c1_ppm,
         fit.t_peak_hr, fit.tau_rise_hr, fit.tau_decay_hr, fit.jitter_ppm,
-        ECLIPSE_DEPTH_PPM_FIXED,
     )
 
-    theta_astro = fit_summary_to_theta_astro(fit)
+    theta = fit_summary_to_theta(fit)
 
-    df["model_flux"] = astrophysical_flux(df["bjd_utc"].to_numpy(dtype=float), theta_astro)
+    df["model_flux"] = astrophysical_flux(df["bjd_utc"].to_numpy(dtype=float), theta)
     df["residual_flux"] = df["flux_corr_final"].to_numpy(dtype=float) - df["model_flux"].to_numpy(dtype=float)
     df["residual_ppm"] = df["residual_flux"] * 1.0e6
 
     binned_time = T0_TRANSIT + (binned["phase_center"].to_numpy(dtype=float) - PHASE_TRANSIT) * P_ORB
-    binned["model_flux"] = astrophysical_flux(binned_time, theta_astro)
+    binned["model_flux"] = astrophysical_flux(binned_time, theta)
     binned["residual_flux"] = binned["flux_median"].to_numpy(dtype=float) - binned["model_flux"].to_numpy(dtype=float)
     binned["residual_ppm"] = binned["residual_flux"] * 1.0e6
 
@@ -891,7 +942,7 @@ def main():
 
     df.to_csv(lightcurve_path, index=False)
     binned.to_csv(binned_path, index=False)
-    posterior_summary_dataframe(flat_chain, fit, measured_eclipse_depth_ppm).to_csv(summary_path, index=False)
+    posterior_summary_dataframe(flat_chain, fit, eclipse_depth_prior_mean_ppm).to_csv(summary_path, index=False)
 
     plot_dewit_fig1_style(binned=binned, fit=fit, output_png=figure_path)
 
