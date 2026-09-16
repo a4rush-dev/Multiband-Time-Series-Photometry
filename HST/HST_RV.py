@@ -371,9 +371,9 @@ print("\nJOINT RV+HST: burn-in...")
 sampler.run_mcmc(pos0, 3000, progress=True)
 sampler.reset()
 print("JOINT RV+HST: production...")
-sampler.run_mcmc(None, 6000, progress=True)
+sampler.run_mcmc(None, 120000, progress=True)
 
-flat = sampler.get_chain(thin=10, flat=True)
+flat = sampler.get_chain(thin=2, flat=True)
 theta_med = np.percentile(flat, 50, axis=0)
 
 theta_rv_med, theta_hst_med = split_theta(theta_med)

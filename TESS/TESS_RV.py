@@ -400,14 +400,15 @@ def main() -> None:
         args=(t_win, f_win, ferr_win, rv_model),
     )
 
-    print("\nRV INTEGRATION: running short joint test...")
-    sampler_joint.run_mcmc(pos_joint, 1000, progress=True)
+    print("\nRV INTEGRATION: burn-in...")
+    sampler_joint.run_mcmc(pos_joint, 3000, progress=True)
 
-    flat_joint = sampler_joint.get_chain(
-        discard=200,
-        thin=5,
-        flat=True,
-    )
+    sampler_joint.reset()
+
+    print("RV INTEGRATION: production...")
+    sampler_joint.run_mcmc(None, 120000, progress=True)
+
+    flat_joint = sampler_joint.get_chain(thin=2, flat=True)
 
     best_joint = np.median(flat_joint, axis=0)
 
@@ -521,7 +522,7 @@ def main() -> None:
     ax_joint.legend()
     plt.show()
 
-    rv_model.plot_phase_rv(theta=best_rv_joint, samples=rv_samples, nsamples = 100,)
+    rv_model.plot_phase_rv(theta_rv=best_rv_joint, samples=rv_samples, nsamples = 100,)
     rv_model.plot_residual_histogram(theta=best_rv_joint)
     rv_model.plot_corner(flat_samples=rv_samples, truths=best_rv_joint)
 
