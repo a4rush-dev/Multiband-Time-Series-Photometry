@@ -551,6 +551,19 @@ class HatP2RVModel:
             labels=labels,
             truths=truths,
             show_titles=True,
+
+            bins = 25,
+            smooth = 2.5,
+            smooth1d=2.0,
+
+            plot_datapoints=False,
+            plot_density = False,
+            plot_contours=True,
+            fill_contours=False,
+            no_fill_countours=True,
+            color="navy",
+            levels=(0.393,0.865),
+            quiet=True,
         )
 
         if filename is not None:
